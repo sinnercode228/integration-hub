@@ -1,0 +1,41 @@
+# API + separate delivery worker sharing one Redis queue.
+# Without Redis, `relay serve` alone runs an in-process queue and worker (see README).
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes: [redis-data:/data]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  api:
+    build: .
+    env_file: [{ path: .env, required: false }]
+    environment:
+      RELAY_QUEUE_BACKEND: redis
+      RELAY_REDIS_URL: redis://redis:6379/0
+      RELAY_RUN_WORKER: "false"        # deliveries are handled by the worker service
+    ports: ["8000:8000"]
+    volumes: [relay-data:/app/data]
+    depends_on:
+      redis: { condition: service_healthy }
+
+  worker:
+    build: .
+    command: ["relay", "worker"]
+    env_file: [{ path: .env, required: false }]
+    environment:
+      RELAY_QUEUE_BACKEND: redis
+      RELAY_REDIS_URL: redis://redis:6379/0
+    volumes: [relay-data:/app/data]
+    depends_on:
+      redis: { condition: service_healthy }
+    healthcheck:
+      disable: true
+
+volumes:
+  redis-data:
+  relay-data:

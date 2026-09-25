@@ -1,0 +1,37 @@
+{
+  "name": "relay-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Relay admin dashboard: events, delivery statuses, dead letters, replay (demo mode runs on in-browser mock data).",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "build:pages": "BASE_PATH=/integration-hub/ VITE_API_MODE=mock npm run build",
+    "build:admin": "BASE_PATH=/admin/ VITE_API_MODE=live npm run build",
+    "preview": "vite preview",
+    "lint": "eslint . && tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0"
+  },
+  "devDependencies": {
+    "@eslint/js": "^10.0.1",
+    "@testing-library/jest-dom": "^6.9.0",
+    "@testing-library/react": "^16.3.0",
+    "@types/node": "^24.13.6",
+    "@types/react": "^19.2.0",
+    "@types/react-dom": "^19.2.0",
+    "@vitejs/plugin-react": "^6.0.0",
+    "eslint": "^10.11.0",
+    "eslint-plugin-react-hooks": "^7.0.0",
+    "globals": "^17.12.0",
+    "jsdom": "^27.0.0",
+    "typescript": "~5.9.3",
+    "typescript-eslint": "^8.46.0",
+    "vite": "^8.0.0",
+    "vitest": "^4.0.0"
+  }
+}

@@ -1,0 +1,189 @@
+# Relay integration config (demo project).
+#
+# sources       - who sends webhooks to us:        POST /webhooks/<source id>
+# destinations  - where events are delivered (connector + options)
+# routes        - which events go where and how the payload is mapped
+# stock         - MoySklad stock proxy for the storefront widget: GET /api/stock?sku=...
+#
+# Secrets are never stored here: ${VAR} reads an environment variable,
+# ${VAR:-value} provides a default for local development. See .env.example.
+# Template syntax: {{ path | filter(arg) }} - see README "Mapping rules".
+version: 1
+
+sources:
+  tilda-site:
+    connector: tilda
+    description: Contact forms and cart orders from the storefront (Tilda)
+    secret: ${TILDA_API_KEY:-dev-tilda-key}
+    options:
+      key_field: api_key
+
+  amocrm:
+    connector: amocrm
+    description: amoCRM account webhooks (URL contains ?token=...)
+    secret: ${AMOCRM_WEBHOOK_TOKEN:-dev-amocrm-token}
+
+  bitrix:
+    connector: bitrix24
+    description: Bitrix24 event handlers (application_token)
+    secret: ${BITRIX_APP_TOKEN:-dev-bitrix-token}
+    options:
+      rest_webhook_url: ${BITRIX_REST_WEBHOOK_URL:-}
+
+  partner-api:
+    connector: generic
+    description: Any system that can sign JSON with HMAC-SHA256
+    secret: ${PARTNER_HMAC_SECRET:-dev-partner-secret}
+    options:
+      type_field: type
+      id_field: id
+
+destinations:
+  sales-telegram:
+    connector: telegram
+    description: Sales team chat
+    options:
+      bot_token: ${TELEGRAM_BOT_TOKEN:-000000:dev-token}
+      chat_id: ${TELEGRAM_CHAT_ID:--1000000000000}
+      api_base: ${TELEGRAM_API_BASE:-https://api.telegram.org}
+
+  leads-sheet:
+    connector: google_sheets
+    description: Lead log for the marketing team
+    options:
+      spreadsheet_id: ${SHEETS_SPREADSHEET_ID:-dev-spreadsheet}
+      range: "Leads!A:H"
+      service_account_json: ${GOOGLE_SERVICE_ACCOUNT_JSON:-}
+      access_token: ${GOOGLE_ACCESS_TOKEN:-dev-google-token}
+
+  amocrm-leads:
+    connector: amocrm_lead
+    description: Create a lead + contact in amoCRM
+    max_attempts: 12
+    options:
+      subdomain: ${AMOCRM_SUBDOMAIN:-demo}
+      access_token: ${AMOCRM_ACCESS_TOKEN:-dev-amocrm-access-token}
+      pipeline_id: ${AMOCRM_PIPELINE_ID:-0}
+      tags: [relay]
+
+  manager-email:
+    connector: smtp
+    description: Order notification for the shop manager
+    options:
+      host: ${SMTP_HOST:-localhost}
+      port: ${SMTP_PORT:-1025}
+      username: ${SMTP_USERNAME:-}
+      password: ${SMTP_PASSWORD:-}
+      start_tls: false
+      from_addr: ${SMTP_FROM:-relay@example.com}
+      to: ["${ORDER_EMAIL_TO:-manager@example.com}"]
+
+  warehouse-webhook:
+    connector: webhook
+    description: Fulfilment system (signed JSON)
+    timeout_seconds: 10
+    options:
+      url: ${WAREHOUSE_WEBHOOK_URL:-http://localhost:9999/orders}
+      secret: ${WAREHOUSE_WEBHOOK_SECRET:-dev-warehouse-secret}
+
+routes:
+  - name: site-leads
+    description: Every form on the site -> chat, sheet and CRM
+    match:
+      source: tilda-site
+      type: form.submitted
+    deliver:
+      - to: sales-telegram
+        template:
+          text: |-
+            <b>Новая заявка с сайта</b>
+            Форма: {{ fields.form_name | default('без названия') }}
+            Имя: {{ contact.name | default('—') }}
+            Телефон: {{ contact.phone | phone | default('—') }}
+            Комментарий: {{ fields.comment | default('—') | truncate(300) }}
+            UTM: {{ fields.utm.utm_source | default('direct') }}
+      - to: leads-sheet
+        template:
+          values:
+            - "{{ received_at | date('%d.%m.%Y %H:%M') }}"
+            - "{{ contact.name }}"
+            - "{{ contact.phone | phone }}"
+            - "{{ contact.email | lower }}"
+            - "{{ fields.form_name }}"
+            - "{{ fields.utm.utm_source | default('direct') }}"
+            - "{{ fields.utm.utm_campaign }}"
+            - "{{ id }}"
+      - to: amocrm-leads
+        template:
+          name: "Сайт: {{ fields.form_name | default('заявка') }}"
+          contact:
+            name: "{{ contact.name }}"
+            phone: "{{ contact.phone }}"
+            email: "{{ contact.email }}"
+          tags: ["tilda", "{{ fields.utm.utm_source | default('direct') }}"]
+          note: "{{ fields.comment | default('') }}"
+
+  - name: site-orders
+    description: Paid cart orders -> manager e-mail, warehouse, chat
+    match:
+      source: tilda-site
+      type: order.created
+    deliver:
+      - to: manager-email
+        template:
+          subject: "Заказ {{ fields.order.id }} на {{ fields.order.amount }} ₽"
+          text: |-
+            Покупатель: {{ contact.name }} ({{ contact.phone | phone }}, {{ contact.email }})
+            Сумма: {{ fields.order.amount }} ₽
+            Позиции: {{ fields.order.products | json }}
+      - to: warehouse-webhook
+        template:
+          order_id: "{{ fields.order.id }}"
+          amount: "{{ fields.order.amount | float }}"
+          items: "{{ fields.order.products }}"
+          customer:
+            name: "{{ contact.name }}"
+            phone: "{{ contact.phone | phone }}"
+      - to: sales-telegram
+        template:
+          text: "<b>Заказ {{ fields.order.id }}</b> на {{ fields.order.amount }} ₽ · {{ contact.name }}"
+
+  - name: crm-won-deals
+    description: amoCRM lead moved to "won" (status 142) -> sheet + warehouse
+    match:
+      source: amocrm
+      type: lead.status_changed
+      where:
+        - { path: fields.status_id, op: eq, value: 142 }
+    deliver:
+      - to: leads-sheet
+        template:
+          values: ["{{ received_at | date }}", "amoCRM", "{{ fields.name }}", "{{ fields.price | int }}", "won"]
+      - to: warehouse-webhook
+
+  - name: bitrix-new-leads
+    description: New Bitrix24 leads -> sales chat
+    match:
+      source: bitrix
+      type: [lead.created, deal.created]
+    deliver:
+      - to: sales-telegram
+        template:
+          text: "<b>Bitrix24: {{ type }}</b> #{{ fields.entity_id }} · {{ contact.name | default('без имени') }} {{ contact.phone | phone | default('') }}"
+
+  - name: partner-events
+    description: Everything from the partner API -> warehouse (as is)
+    match:
+      source: partner-api
+      type: "*"
+    deliver:
+      - to: warehouse-webhook
+
+stock:
+  connector: moysklad
+  options:
+    token: ${MOYSKLAD_TOKEN:-dev-moysklad-token}
+    match_field: article
+    cache_ttl_seconds: 60
+    stale_ttl_seconds: 900
+    low_stock_threshold: 3

@@ -1,0 +1,1 @@
+{"type": "shipment.created", "id": "P-10001", "contact": {"name": "Ольга Новикова", "email": "olga@example.org"}, "data": {"tracking": "RU123456789", "items": 3}}

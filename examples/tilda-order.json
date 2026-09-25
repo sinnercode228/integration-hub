@@ -1,0 +1,16 @@
+{
+  "name": "Игорь Петров",
+  "phone": "89001112233",
+  "email": "igor@example.com",
+  "formname": "Корзина",
+  "tranid": "7654321:111",
+  "api_key": "dev-tilda-key",
+  "payment": {
+    "orderid": "1000042",
+    "amount": "3530",
+    "products": [
+      { "name": "Кружка керамическая", "sku": "MUG-101", "quantity": 2, "amount": 1780 },
+      { "name": "Подставка из дуба", "sku": "OAK-520", "quantity": 1, "amount": 1150 }
+    ]
+  }
+}

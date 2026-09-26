@@ -1,5 +1,7 @@
 # Relay
 
+**Русский** · [English](README.en.md)
+
 Relay принимает вебхуки и раскладывает их по получателям. Источником может быть Tilda, amoCRM, Bitrix24 или любая система, которая подпишет JSON заголовком `X-Relay-Signature` (HMAC-SHA256); получателями — Telegram, Google Sheets, amoCRM, почта и внешние вебхуки. Каждая доставка идёт отдельной задачей со своими ретраями, а то, что так и не дошло, ждёт в dead letters с историей попыток. Бэкенд на FastAPI и httpx, события в SQLite, очередь в Redis или в памяти процесса, маршруты и маппинг полей в YAML; дашборд на React 19 и TypeScript.
 
 Демо: https://sinnercode228.github.io/integration-hub/ — только дашборд, бэкенда на Pages нет. События и сбои там разыгрывает отдельная симуляция на TypeScript прямо в браузере ([`engine.ts`](dashboard/src/api/mock/engine.ts)), данные в ней сгенерированы. Отказы в симуляции заданы сценарием, паузы между попытками идут без jitter, replay всегда проходит. Проще всего нажать «+ Tilda: форма» на панели «Отправить тестовый вебхук» (в английском интерфейсе «+ Tilda: form»): новое событие встанет первым в списке, по клику откроются его доставки в Telegram, Sheets и amoCRM. Дашборд перечитывает открытое событие каждые 2 с, поэтому новые попытки будут появляться в нём сами. У событий с этой кнопки сценарий роняет около 30% доставок, так что за два-три нажатия обычно видно и сбой, и ретрай, как на скриншоте ниже.
@@ -136,4 +138,8 @@ cd ../dashboard && npm run lint && npm test    # ESLint + tsc, 15 тестов V
 
 Сеть в тестах замокана через respx, Redis — через fakeredis. Очередь и идемпотентность прогоняются одними контрактными тестами на памяти и на fakeredis, хранилище — на памяти и на SQLite ([`tests/test_infra.py`](backend/tests/test_infra.py)). CI гоняет бэкенд на Python 3.12, 3.13 и 3.14, собирает дашборд и Docker-образ.
 
-Ещё скриншоты: [dead letters](docs/screenshots/dead-letters.png), [коннекторы и маршруты](docs/screenshots/connectors.png), [телефон, тёмная тема](docs/screenshots/mobile.png). Лицензия MIT.
+Ещё скриншоты: [dead letters](docs/screenshots/dead-letters.png), [коннекторы и маршруты](docs/screenshots/connectors.png), [телефон, тёмная тема](docs/screenshots/mobile.png).
+
+---
+
+Автор — Грешный Котик, беру заказы на похожие задачи: Telegram [@sinnercode](https://t.me/sinnercode). Лицензия [MIT](LICENSE).

@@ -1,214 +1,139 @@
-# Relay — integration hub
+# Relay
 
-[![CI](https://github.com/sinnercode228/integration-hub/actions/workflows/ci.yml/badge.svg)](https://github.com/sinnercode228/integration-hub/actions/workflows/ci.yml)
-[![Pages](https://github.com/sinnercode228/integration-hub/actions/workflows/pages.yml/badge.svg)](https://sinnercode228.github.io/integration-hub/)
-![Python](https://img.shields.io/badge/python-3.12%E2%80%933.14-3776AB)
-![FastAPI](https://img.shields.io/badge/FastAPI-async-009688)
-![React](https://img.shields.io/badge/React-19-61DAFB)
-![License](https://img.shields.io/badge/license-MIT-green)
+Relay принимает вебхуки и раскладывает их по получателям. Источником может быть Tilda, amoCRM, Bitrix24 или любая система, которая подпишет JSON заголовком `X-Relay-Signature` (HMAC-SHA256); получателями — Telegram, Google Sheets, amoCRM, почта и внешние вебхуки. Каждая доставка идёт отдельной задачей со своими ретраями, а то, что так и не дошло, ждёт в dead letters с историей попыток. Бэкенд на FastAPI и httpx, события в SQLite, очередь в Redis или в памяти процесса, маршруты и маппинг полей в YAML; дашборд на React 19 и TypeScript.
 
-**Live demo:** https://sinnercode228.github.io/integration-hub/ — the admin dashboard running on mock events in your browser, no backend needed.
+Демо: https://sinnercode228.github.io/integration-hub/ — только дашборд, бэкенда на Pages нет. События и сбои там разыгрывает отдельная симуляция на TypeScript прямо в браузере ([`engine.ts`](dashboard/src/api/mock/engine.ts)), данные в ней сгенерированы. Отказы в симуляции заданы сценарием, паузы между попытками идут без jitter, replay всегда проходит. Проще всего нажать «+ Tilda: форма» на панели «Отправить тестовый вебхук» (в английском интерфейсе «+ Tilda: form»): новое событие встанет первым в списке, по клику откроются его доставки в Telegram, Sheets и amoCRM. Дашборд перечитывает открытое событие каждые 2 с, поэтому новые попытки будут появляться в нём сами. У событий с этой кнопки сценарий роняет около 30% доставок, так что за два-три нажатия обычно видно и сбой, и ретрай, как на скриншоте ниже.
 
-> Демо-проект / Demo project. «Relay» — вымышленный бренд; все люди, заказы и компании в демо-данных вымышлены.
->
-> Tilda, amoCRM, Bitrix24, Telegram, Google Sheets и МойСклад — сторонние сервисы, с которыми Relay интегрируется через их публичные API; проект с ними не связан. / These are third-party services Relay integrates with via their public APIs; the project is not affiliated with them.
+![Детали события в демо: Telegram доставлен, Sheets (ConnectTimeout) и amoCRM (504) повторяются через 2, потом через 4 с](docs/screenshots/event-details.png)
 
-[Русский](#русский) · [English](#english)
+## Заявка с Tilda по шагам
 
-![Dashboard](docs/screenshots/dashboard.png)
+Маршрут `site-leads` из [`config/relay.yaml`](config/relay.yaml) отправляет каждую форму с сайта в чат продаж в Telegram, строкой в Google Sheets и сделкой в amoCRM. Возьмём заявку в момент, когда Telegram отвечает `429`, а amoCRM не укладывается в таймаут.
 
----
+1. `POST /webhooks/tilda-site` сравнивает API-ключ Tilda через `hmac.compare_digest` и убирает его из данных до сохранения, разбирает форму и строит ключ идемпотентности из `tranid`. Событие и три доставки пишутся в SQLite одной транзакцией, в очередь уходят три задачи, Tilda получает `202`. Отвечать приходится сразу: amoCRM, например, отключает вебхук после серии медленных или неудачных ответов (комментарий в [`connectors/inbound/amocrm.py`](backend/src/relay/connectors/inbound/amocrm.py)), поэтому доставками занимается фоновый воркер.
+2. Каждая доставка — отдельная задача, воркер обрабатывает их независимо. Sheets ответил `200`, эта доставка закрыта.
+3. Telegram вернул `429` и `parameters.retry_after` в теле ответа. Коннектор передаёт это число воркеру, и следующая попытка назначается не раньше, чем просит Telegram. В [тесте](backend/tests/test_pipeline.py) при `retry_after: 40` задержка получается 40 с вместо базовых 2.
+4. Запрос в amoCRM не уложился в таймаут: httpx ждёт каждую фазу запроса до 10 с, всю попытку `asyncio.wait_for` обрезает через 20 с. Это временная ошибка: ретрай примерно через 2 с, потом через 4, 8 и дальше. У `amocrm-leads` в конфиге `max_attempts: 12`, это около часа ожидания; по умолчанию попыток 8, около 4 минут.
+5. Когда попытки кончаются, доставка получает статус `dead`, событие — `partial`. Её можно отправить заново из дашборда или через `POST /admin/api/deliveries/{id}/replay`: доставка вернётся в `pending`, старые попытки останутся в истории, а `attempt_base` запомнит их число, и бюджет попыток начнётся заново.
 
-## Русский
+Tilda, amoCRM и Bitrix24 присылают статический секрет: API-ключ полем запроса у Tilda, токен в URL у amoCRM, `application_token` у Bitrix24. Подпись с окном 300 с и несколькими `v1=` для ротации секрета есть только у generic-источника ([`security.py`](backend/src/relay/security.py)). Сетевой запрос прямо в обработчике делает только Bitrix24 с настроенным `rest_webhook_url`: событие дополняется через `crm.<entity>.get`, таймаут 5 с.
 
-**Relay** — сервис интеграций для бизнеса: принимает вебхуки из Tilda, amoCRM, Bitrix24 и любых систем с HMAC-подписью, приводит их к единому формату и **надёжно** доставляет в Telegram, Google Sheets, amoCRM, почту и внешние вебхуки. Ретраи с экспоненциальной задержкой, dead-letter очередь, повтор доставки в один клик, метрики Prometheus и админ-панель.
+## Очередь на sorted sets с lease
 
-### Какую проблему решает
-
-Типичная связка «форма на сайте → CRM → чат → таблица» обычно собирается из разрозненных скриптов или no-code сервисов. Ломается она тихо: Telegram ответил 429, токен amoCRM истёк, склад на обслуживании — и заявка потерялась. Relay делает этот поток наблюдаемым и отказоустойчивым:
-
-- **каждое событие сохраняется** до доставки, у каждой доставки видна история попыток и ошибок;
-- **временные ошибки** (5xx, 429, таймауты) повторяются с backoff и учётом `Retry-After`, **постоянные** (4xx, битый шаблон) сразу уходят в dead-letter;
-- **дубли** (CRM и конструкторы сайтов повторяют вебхуки) отсекаются ключами идемпотентности;
-- **маршруты и маппинг** описываются в YAML, без правки кода.
-
-### Возможности
-
-| | |
-|---|---|
-| **Входящие коннекторы** | Tilda (формы и заказы корзины, ping `test=test`, UTM из cookies), amoCRM (form-urlencoded в PHP-нотации, несколько сущностей в одном запросе), Bitrix24 (`application_token`, обогащение через `crm.*.get`), Generic JSON с HMAC-SHA256 |
-| **Исходящие коннекторы** | Telegram Bot API (HTML-экранирование данных пользователя), Google Sheets (service account JWT без Google SDK), amoCRM (`leads/complex`: сделка + контакт + примечание), SMTP (aiosmtplib), generic webhook (подпись + `Idempotency-Key`) |
-| **Безопасность** | проверка подписи/токена в constant time, окно по времени против replay-атак, ротация секретов (несколько `v1=`), секреты только из env (в `prod` сервис не стартует с плейсхолдерами `dev-*`), вырезание токенов из ошибок и логов |
-| **Надёжность** | очередь с lease (at-least-once), backoff `2s·2ⁿ` + jitter, `Retry-After`, dead-letter, replay с новым бюджетом попыток, Redis или in-process очередь |
-| **Маппинг** | безопасный мини-язык шаблонов `{{ contact.phone \| phone }}`: 14 фильтров, аргументы только литералы (`ast.literal_eval`), сохранение типов |
-| **МойСклад** | прокси остатков `GET /api/stock?sku=…` для витрины: TTL-кэш, single-flight, stale-if-error, CORS; токен никогда не попадает в браузер |
-| **Наблюдаемость** | структурные JSON-логи (structlog) с `request_id`, `/metrics` для Prometheus, `/healthz`, `/readyz`, админ-API и дашборд |
-
-### Архитектура
-
-```mermaid
-flowchart LR
-    subgraph Sources
-      T[Tilda] & A[amoCRM] & B[Bitrix24] & G[Partner JSON + HMAC]
-    end
-    T & A & B & G -->|POST /webhooks/:source| V[verify signature]
-    V --> N[parse + normalize]
-    N --> I{idempotency key}
-    I -- duplicate --> D200[200 duplicate]
-    I -- new --> S[(event store<br/>SQLite)]
-    S --> R[routing rules<br/>YAML]
-    R --> Q[(queue<br/>Redis / in-process)]
-    Q --> W[delivery worker]
-    W -->|render template| C{connector}
-    C --> TG[Telegram] & GS[Google Sheets] & AM[amoCRM lead] & SM[SMTP] & WH[Webhook]
-    W -- retryable error --> Q
-    W -- permanent / out of attempts --> DLQ[(dead letters)]
-    DLQ -- replay --> Q
-```
-
-HTTP-обработчик выполняет только быстрый путь (проверка → нормализация → запись → постановка в очередь) и сразу отвечает `202`, поэтому amoCRM и Bitrix24 не отключают вебхук из-за медленных ответов. Доставки делает воркер — в том же процессе (`relay serve`) или отдельным сервисом (`relay worker`) при общей очереди в Redis.
+[`queue/redis.py`](backend/src/relay/queue/redis.py) держит три ключа:
 
 ```
-backend/src/relay/
-├── api/            FastAPI: webhooks, admin API, stock proxy, ops (health, metrics)
-├── connectors/     плагины: inbound/*, outbound/*, moysklad.py, реестр @inbound/@outbound
-├── queue/          протокол очереди + in-memory и Redis реализации
-├── store/          протокол хранилища + in-memory и SQLite (WAL) реализации
-├── ingest.py       verify → normalize → dedupe → store → route → enqueue
-├── worker.py       ретраи, backoff, dead-letter, replay
-├── templating.py   безопасный язык шаблонов маппинга
-├── routing.py      условия маршрутов (eq, in, contains, regex, gt, …)
-└── container.py    composition root (тот же код в тестах и в проде)
-dashboard/          React + TypeScript SPA; src/api/mock — симуляция конвейера для демо
-config/relay.yaml   источники, получатели, маршруты, шаблоны
+relay:q:scheduled   ZSET  задача -> время, с которого её можно брать
+relay:q:inflight    ZSET  задача -> дедлайн lease
+relay:q:dead        HASH  delivery_id -> {job, reason, at}
 ```
 
-### Конфигурация маршрутов
+Очередь я сделал на sorted sets: отложенный ретрай здесь — обычный `ZADD` с будущим score, и отдельная очередь задержек не нужна. Повторный `enqueue` той же задачи только сдвигает её время. В `docker compose` Redis пишет AOF (`--appendonly yes`).
+
+Воркер выбирает готовые задачи через `ZRANGEBYSCORE` и для каждой выполняет `MULTI { ZREM scheduled; ZADD inflight }` с lease 120 с. Задачу берёт в работу только тот воркер, у которого `ZREM` действительно её удалил, поэтому несколько процессов `relay worker` на одном Redis не хватают одну задачу вдвоём. Попытку по умолчанию обрезает `asyncio.wait_for` через 20 с, так что lease не истекает посреди запроса.
+
+Перед каждым проходом `requeue_expired` возвращает задачи с истёкшим lease из `inflight` в `scheduled` через `ZADD NX`. Если обработка упала с исключением или процесс умер, задача остаётся в `inflight` до конца lease, потом её берут снова (at-least-once). В [`worker.py`](backend/src/relay/worker.py) после попытки сначала сохраняется её результат, потом ретрай ставится в `scheduled`, и только потом `ack`. Если процесс умрёт между `enqueue` и `ack`, задача окажется в обоих множествах, и `ZADD NX` при возврате не перезапишет уже назначенную задержку. Если поменять местами, задача в этом окне пропала бы из обоих множеств.
+
+## Откуда берётся ключ идемпотентности
+
+CRM и конструкторы сайтов повторяют вебхуки при таймаутах, так что дубли — обычный трафик. [`derive_key`](backend/src/relay/idempotency.py) берёт первый, какой есть:
+
+1. заголовок `Idempotency-Key`, если отправитель его прислал;
+2. внешний id из самой системы: у amoCRM `сущность:id:действие:last_modified`, у Bitrix24 `событие:id:ts`, у Tilda `tranid` (если его нет — `orderid` заказа), у generic-источника настраиваемое поле;
+3. SHA-256 от тела запроса.
+
+Из-за `last_modified` следующая правка той же сделки в amoCRM даёт новый ключ и проходит как новое событие. amoCRM может упаковать в один запрос несколько сущностей, каждая становится отдельным событием; к ключам из заголовка и тела тогда добавляется `:index`.
+
+С Redis ключ занимается через `SET NX EX` на 7 дней, значение — id нового события; без Redis это словарь в памяти процесса с тем же сроком, после перезапуска он пуст. Если запись события в хранилище не удалась, ключ освобождается, иначе повторная отправка от источника тоже посчиталась бы дублем. Если ключ истёк между `SET` и `GET`, захват повторяется. Повтор с уже занятым ключом, например тот же вебхук от Tilda, получает `200` и id созданного раньше события в `duplicates`.
+
+## Временная ошибка или постоянная
+
+Общее правило, какие ошибки временные, живёт в одном месте, [`connectors/http.py`](backend/src/relay/connectors/http.py): 408, 409, 425, 429, любой 5xx, сетевые ошибки и таймауты повторяются, остальные 4xx сразу уходят в dead letters. Ошибка в шаблоне тоже постоянная. Коннекторы уточняют правило там, где у API свои особенности:
+
+| Получатель | Повторяется | Сразу в dead letters |
+|---|---|---|
+| Telegram | 429 (задержка из `parameters.retry_after`), 5xx | остальные 4xx: 400 chat not found, 403 бот заблокирован |
+| Google Sheets | 401: с сервисным аккаунтом кэшированный токен сбрасывается и следующая попытка выпускает новый; со статическим `access_token` ретраи идут с тем же | по общему правилу |
+| amoCRM | по общему правилу | 401 (токен статический, OAuth refresh нет) |
+| SMTP | коды < 500, ошибки соединения | коды ≥ 500, все получатели отклонены |
+
+Для сервисного аккаунта токен Google Relay выпускает сам, без Google SDK: JWT RS256 через PyJWT, и держит его в кэше, пока до истечения не останется 60 с ([`google_sheets.py`](backend/src/relay/connectors/outbound/google_sheets.py)).
+
+Задержку считает [`RetryPolicy`](backend/src/relay/worker.py): `min(3600, 2·2^(n−1))` секунд, потом она умножается на `1 − 0.2·random()`. Так jitter только укорачивает паузу и за потолок её не выводит. Если получатель прислал `Retry-After` (секунды или HTTP-дата), берётся `max(задержка, min(retry_after, 3600))`. `max_attempts` и `timeout_seconds` задаются для каждого получателя отдельно.
+
+Текст ошибки попадает в историю попыток только после `redact`: воркер вырезает из него секреты коннектора (у Telegram токен бота стоит прямо в URL). Тест из шага 3 заодно проверяет, что токен Sheets из текста `ConnectError` не доходит до `last_error`.
+
+## Маршруты в YAML и свой язык шаблонов
+
+Mapping rules в [`config/relay.yaml`](config/relay.yaml) — это блок `routes`: `match` выбирает события по источнику, типу и условиям `where`, `deliver` перечисляет получателей и шаблон для каждого. Кусок настоящего конфига:
 
 ```yaml
 routes:
-  - name: crm-won-deals
+  - name: site-leads
     match:
-      source: amocrm
-      type: lead.status_changed
-      where:
-        - { path: fields.status_id, op: eq, value: 142 }   # «Успешно реализовано»
+      source: tilda-site
+      type: form.submitted
     deliver:
-      - to: leads-sheet
+      - to: sales-telegram
         template:
-          values: ["{{ received_at | date }}", "{{ fields.name }}", "{{ fields.price | int }}"]
-      - to: warehouse-webhook          # без шаблона — шаблон коннектора по умолчанию
+          text: |-
+            <b>Новая заявка с сайта</b>
+            Форма: {{ fields.form_name | default('без названия') }}
+            Имя: {{ contact.name | default('—') }}
+            Телефон: {{ contact.phone | phone | default('—') }}
+            Комментарий: {{ fields.comment | default('—') | truncate(300) }}
+            UTM: {{ fields.utm.utm_source | default('direct') }}
+      # ... leads-sheet, amocrm-leads
 ```
 
-Секреты задаются только через `${ENV_VAR}` / `${ENV_VAR:-default}`; полный список — в [`.env.example`](.env.example). Проверка конфига: `relay check-config`.
+Язык шаблонов я написал свой, без Jinja; парсер в [`templating.py`](backend/src/relay/templating.py). Аргументы фильтров читаются только через `ast.literal_eval`, так что `{{ x | default(__import__('os')) }}` даёт ошибку шаблона (`test_errors_and_no_code_execution` в [`test_core.py`](backend/tests/test_core.py)). Фильтров 14: `phone` (приводит к E.164), `date`, `default`, `int`, `truncate`, `json` и другие. Строка из одного выражения сохраняет тип: `"{{ fields.price | int }}"` станет числом.
 
-### Запуск
+Экранирование задаётся на уровне поля получателя. У Telegram поле `text` уходит с `parse_mode=HTML`: подставленные значения проходят через `html.escape`, теги самого шаблона остаются, и имя `Анна <b>` приходит в чат как `Анна &lt;b&gt;`. У SMTP так же экранируется поле `html`.
 
-**Локально (без Docker и Redis):**
+## Остатки из МойСклад
+
+Отдельно от вебхуков есть `GET /api/stock?sku=…` для виджета остатков на витрине ([`connectors/moysklad.py`](backend/src/relay/connectors/moysklad.py)): токен доступа к МойСклад остаётся на сервере, браузер получает только артикул, количество и статус. Кэш на 60 с; одновременные промахи ждут один `asyncio.Lock` и потом перепроверяют кэш, так что всплеск запросов со страницы товара даёт один запрос в МойСклад. Если МойСклад не отвечает, отдаются значения до 900 секунд давности с пометкой `stale: true`; артикулы уходят в фильтр пачками по 25.
+
+## Где событие может потеряться или задвоиться
+
+- Приём не транзакционный: ключ идемпотентности, событие в SQLite и задачи в очереди пишутся отдельными шагами, и сверки SQLite с очередью нет. Если процесс умрёт между шагами, доставки останутся в `pending` без задачи, повторная отправка того же вебхука получит `200 duplicate`, а ручной replay незавершённой доставки отвечает `409`.
+- Без Redis очередь живёт в памяти: перезапуск `relay serve` теряет запланированные ретраи, доставки остаются `pending`/`retrying`.
+- Доставка at-least-once. Если получатель принял запрос, а ответ потерялся, Relay отправит его ещё раз: в чате появится второе сообщение, в таблице вторая строка, в amoCRM вторая сделка. Отсеять дубль может только получатель исходящего webhook: ему уходит `Idempotency-Key` с id доставки, одинаковый на всех попытках.
+- В amoCRM сделка и примечание уходят двумя запросами. HTTP-ошибку на примечании я не повторяю, а пишу в `note_error`: ретрай создал бы вторую сделку. Но сетевая ошибка на этом запросе идёт мимо `send_request`, воркер считает её неожиданной и повторяет доставку целиком.
+
+## Запуск
+
+Без Docker и Redis, с очередью и ключами идемпотентности в памяти процесса и SQLite в `data/relay.db` (нужен Python 3.12+):
 
 ```bash
 python3 -m venv .venv && . .venv/bin/activate
 pip install -e "backend[dev]"
-relay check-config                    # валидация config/relay.yaml
-relay serve                           # API + воркер: http://127.0.0.1:8000/docs
-examples/send.sh                      # отправить тестовые вебхуки (Tilda, amoCRM, Bitrix24, HMAC)
+relay check-config        # проверка config/relay.yaml и опций коннекторов
+relay serve               # API + воркер в одном процессе, http://127.0.0.1:8000/docs
+# во втором терминале, с активированным .venv (скрипту нужен relay sign):
+examples/send.sh          # вебхуки Tilda, amoCRM, Bitrix24, HMAC и один дубль
 ```
 
-**Дашборд:**
+Дашборд:
 
 ```bash
 cd dashboard && npm ci
-npm run dev                           # демо-режим на mock-данных: http://localhost:5173
-VITE_API_MODE=live npm run dev        # живой API (прокси /admin/api -> :8000)
+npm run dev                       # та же симуляция, что на Pages, http://localhost:5173
+VITE_API_MODE=live npm run dev    # живой API, /admin/api проксируется на :8000
 ```
 
-Собранный дашборд можно отдать самим API: `npm run build:admin`, затем `RELAY_DASHBOARD_DIR=dashboard/dist relay serve` → http://127.0.0.1:8000/admin/ (в Docker это уже настроено).
+`docker compose up --build` поднимает API, отдельный воркер и Redis; дашборд тогда открывается на http://localhost:8000/admin/. API и воркер делят файл SQLite через volume `relay-data`, поэтому развести их по разным машинам нельзя. `/metrics` на том же порту открыт без авторизации.
 
-Режим выбирается при сборке (`VITE_API_MODE=mock|live`, `VITE_API_BASE`) или параметром `?api=live` в URL. В live-режиме в шапке появляется поле для admin-токена (`RELAY_ADMIN_TOKEN`).
+Без `.env` подставляются dev-значения из `relay.yaml` в виде `${VAR:-dev-значение}`. Настоящие секреты кладутся в `.env` по образцу [`.env.example`](.env.example), и оставлять там стоит только заполненные строки: пустая `TILDA_API_KEY=` перекрывает dev-значение, и `relay check-config` падает на источнике без секрета. Настройки процесса — переменные `RELAY_*` из [`settings.py`](backend/src/relay/settings.py). С `RELAY_ENV=prod` сервис откажется запускаться, пока у источников остаются секреты с префиксом `dev-`, а admin API без `RELAY_ADMIN_TOKEN` отвечает `503`; в dev без токена admin API открыт, в логе только предупреждение. Команды CLI: `relay serve | worker | check-config | sign`; `sign` считает `X-Relay-Signature` для generic-источника.
 
-**Docker Compose (API + отдельный воркер + Redis):**
+## Тесты
 
 ```bash
-cp .env.example .env                  # заполнить токены
-docker compose up --build             # http://localhost:8000/admin/
+cd backend && pytest --cov=relay               # 140 тестов, покрытие 92% (coverage.py, branch = true)
+ruff check src tests && mypy                   # mypy в режиме --strict
+cd ../dashboard && npm run lint && npm test    # ESLint + tsc, 15 тестов Vitest
 ```
 
-### Тесты и качество
+Сеть в тестах замокана через respx, Redis — через fakeredis. Очередь и идемпотентность прогоняются одними контрактными тестами на памяти и на fakeredis, хранилище — на памяти и на SQLite ([`tests/test_infra.py`](backend/tests/test_infra.py)). CI гоняет бэкенд на Python 3.12, 3.13 и 3.14, собирает дашборд и Docker-образ.
 
-```bash
-cd backend && pytest --cov=relay       # 140 тестов, покрытие ~92%, без сети и без Docker
-ruff check src tests && mypy           # линтер + mypy --strict
-cd ../dashboard && npm run lint && npm test   # ESLint + tsc, 15 тестов (Vitest)
-```
-
-Внешние API замоканы через **respx** (httpx), Redis — через **fakeredis**; очередь, идемпотентность и хранилище прогоняются одним контрактным набором тестов для каждой реализации. CI (`.github/workflows/ci.yml`): линт, типы, тесты на Python 3.12–3.14, сборка дашборда и Docker-образа.
-
-### Демо на GitHub Pages
-
-`.github/workflows/pages.yml` собирает дашборд с `BASE_PATH=/<repo>/` и `VITE_API_MODE=mock` и публикует через `actions/deploy-pages` (Settings → Pages → Source: **GitHub Actions**). В демо конвейер симулируется в браузере: кнопки «Отправить тестовый вебхук» создают события, которые проходят маршрутизацию, ретраи и dead-letter с той же логикой, что и бэкенд.
-
-| Детали события | Dead letters | Телефон, тёмная тема |
-|---|---|---|
-| ![Event details](docs/screenshots/event-details.png) | ![Dead letters](docs/screenshots/dead-letters.png) | ![Mobile](docs/screenshots/mobile.png) |
-
----
-
-## English
-
-**Relay** is a business integration service: it receives webhooks from Tilda, amoCRM, Bitrix24 and any HMAC-signing system, normalizes them into one event format and **reliably** delivers them to Telegram, Google Sheets, amoCRM, e-mail and outbound webhooks — with exponential-backoff retries, a dead-letter queue, one-click replay, Prometheus metrics and an admin dashboard.
-
-### Why
-
-"Site form → CRM → chat → spreadsheet" glue usually lives in ad-hoc scripts and fails silently: Telegram answers 429, the amoCRM token expires, the warehouse API is in maintenance — and a lead is lost. Relay makes the flow observable and fault-tolerant:
-
-- every event is **persisted before delivery**; each delivery keeps its full attempt history;
-- **transient errors** (5xx, 429, timeouts) are retried with backoff honouring `Retry-After`; **permanent** ones (4xx, broken template) go straight to the dead-letter queue;
-- **duplicates** (CRMs and site builders retry webhooks) are dropped via idempotency keys;
-- **routes and field mapping** live in YAML — no code changes to add a flow.
-
-### Features
-
-- **Inbound:** Tilda (forms, cart orders, `test=test` ping, UTM from cookies), amoCRM (PHP-bracket form bodies, many entities per request), Bitrix24 (`application_token`, optional enrichment via `crm.*.get`), generic JSON signed with HMAC-SHA256 (`X-Relay-Signature: t=…,v1=…`).
-- **Outbound:** Telegram (user data HTML-escaped, `retry_after` honoured), Google Sheets (service-account JWT flow with PyJWT, token cache), amoCRM `leads/complex` (lead + contact + note, no duplicate leads on retry), SMTP (4xx → retry, 5xx → dead), generic webhook (signed, `Idempotency-Key: <delivery id>`).
-- **Security:** constant-time signature/token checks, timestamp tolerance against replays, secret rotation, env-only secrets, secrets scrubbed from errors and logs, admin API behind a Bearer token (mandatory in `prod`); `prod` also refuses to start with the `dev-*` placeholder secrets from `relay.yaml`.
-- **Reliability:** leased queue (at-least-once, crash-safe), `2s × 2ⁿ` backoff with jitter, per-destination `max_attempts`/`timeout_seconds`, dead letters, replay with a fresh attempt budget; Redis for multi-process, in-process fallback for single-node/dev.
-- **Mapping language:** `{{ path | filter(args) }}` with 14 filters (`phone`, `date`, `default`, `int`, `truncate`, `json`…), literal-only arguments (never executes code), type-preserving single expressions.
-- **MoySklad stock proxy:** `GET /api/stock?sku=…` for storefront widgets with TTL cache, single-flight coalescing, stale-if-error and CORS allow-list — the token never reaches the browser.
-- **Observability:** structlog JSON logs with request ids, Prometheus `/metrics`, `/healthz`, `/readyz`, admin API (`/admin/api/events`, `/stats`, `/dead-letters`, `…/replay`, `/connectors`) and the React dashboard.
-
-### Run
-
-```bash
-python3 -m venv .venv && . .venv/bin/activate
-pip install -e "backend[dev]"
-relay serve                  # API + in-process worker, OpenAPI at http://127.0.0.1:8000/docs
-examples/send.sh             # fire sample Tilda / amoCRM / Bitrix24 / HMAC webhooks
-
-cd dashboard && npm ci && npm run dev          # demo mode (mock data)
-VITE_API_MODE=live npm run dev                 # against the local API
-
-docker compose up --build    # API + dedicated worker + Redis, dashboard at /admin/
-
-# serve the built dashboard from the API without Docker
-(cd dashboard && npm run build:admin) && RELAY_DASHBOARD_DIR=dashboard/dist relay serve
-```
-
-CLI: `relay serve | worker | check-config | sign --secret … --file body.json`.
-
-### Tests
-
-- Backend: **140 pytest tests**, ~92% coverage, no network (respx), no Docker (fakeredis, SQLite in tmp); ruff + `mypy --strict`.
-- Dashboard: **15 Vitest tests** (mock engine semantics, HTTP client, formatting, App rendering) + ESLint + `tsc`.
-- CI runs lint, types and tests on Python 3.12/3.13/3.14, builds the dashboard and the Docker image.
-
-### Live demo
-
-Screenshots: [dashboard](docs/screenshots/dashboard.png), [event details](docs/screenshots/event-details.png), [dead letters](docs/screenshots/dead-letters.png), [connectors & routes](docs/screenshots/connectors.png), [mobile, dark theme](docs/screenshots/mobile.png).
-
-GitHub Pages is deployed by `.github/workflows/pages.yml` (Pages source: **GitHub Actions**) with Vite `base = /<repo>/`. The dashboard's data layer is an interface with two implementations — `HttpRelayApi` (real admin API) and `MockRelay` (in-browser simulation of routing, backoff, dead letters and replay) — selected by `VITE_API_MODE` or `?api=live|mock`.
-
----
-
-Author: **sinnercode228** — full-stack developer · GitHub [@sinnercode228](https://github.com/sinnercode228) · Telegram [@sinnercode](https://t.me/sinnercode)
-
-Demo project / Демо-проект. MIT License.
+Ещё скриншоты: [dead letters](docs/screenshots/dead-letters.png), [коннекторы и маршруты](docs/screenshots/connectors.png), [телефон, тёмная тема](docs/screenshots/mobile.png). Лицензия MIT.

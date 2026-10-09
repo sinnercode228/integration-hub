@@ -14,6 +14,21 @@ Demo: https://sinnercode228.github.io/integration-hub/. It is the dashboard only
 
 ## The path of one webhook
 
+```mermaid
+flowchart TD
+    SRC["Tilda, amoCRM, Bitrix24, signed JSON"] -->|"POST /webhooks/{source_id}"| ING["ingest: verify, normalize, idempotency key"]
+    ING -->|"event and deliveries in one transaction"| DB[("SQLite")]
+    ING -->|"one job per delivery"| Q["queue: Redis sorted sets or memory"]
+    Q -->|"reserve with a 120 s lease"| W["worker"]
+    W -->|"read event, save attempt"| DB
+    W -->|"render template, send"| OUT["Telegram, Google Sheets, amoCRM, SMTP, webhook"]
+    W -->|"retryable error: enqueue with backoff"| Q
+    W -->|"attempts used up or permanent error"| DL["dead letters"]
+    DL -->|"replay from the dashboard"| Q
+```
+
+Write-up on how the queue leases, retries and dead-letters jobs: [Relay's delivery queue on two Redis sorted sets with a 120-second lease](https://github.com/sinnercode228/sinnercode228/blob/main/notes/relay-redis-lease-queue.md).
+
 1. `POST /webhooks/<source>` reads the body, up to `RELAY_MAX_BODY_BYTES` (1 000 000 by default) ([`api/webhooks.py`](backend/src/relay/api/webhooks.py)). The source's connector checks the secret or signature and parses the body into one or more normalized events: `type`, `external_id`, `contact`, `fields`, `raw` ([`ingest.py`](backend/src/relay/ingest.py)).
 2. Each event claims an idempotency key. If the key is already taken, the event is a duplicate: the id of the first event is returned and nothing else happens.
 3. Routes from [`config/relay.yaml`](config/relay.yaml) are matched. One delivery record is created per matching destination, and the event with its deliveries is written to SQLite in one transaction.
@@ -96,7 +111,7 @@ relay:q:dead        HASH  delivery_id -> {job, reason, at}
 
 I built the queue on sorted sets because a delayed retry is then a `ZADD` with a future score, and no separate delay queue is needed. Enqueuing the same job again only moves its time.
 
-The worker picks due jobs with `ZRANGEBYSCORE` and claims each one with `MULTI { ZREM scheduled; ZADD inflight }`, with a 120 s lease (`RELAY_LEASE_SECONDS`). A worker processes a job only if its own `ZREM` removed it, so several `relay worker` processes on one Redis do not take the same job. Every worker loop starts with `requeue_expired`, which moves jobs with an expired lease from `inflight` back to `scheduled` with `ZADD NX`. The in-process queue ([`queue/memory.py`](backend/src/relay/queue/memory.py)) follows the same rules with dicts.
+The worker picks due jobs with `ZRANGEBYSCORE` and claims each one with `MULTI { ZREM scheduled; ZADD inflight }`, with a 120 s lease (`RELAY_LEASE_SECONDS`). A worker processes a job only if its own `ZREM` removed it, so two `relay worker` processes that read the same due job do not both claim it. Every worker loop starts with `requeue_expired`, which moves jobs with an expired lease from `inflight` back to `scheduled` with `ZADD NX`. Neither transaction rechecks the score it read, so with several workers on one Redis a retry can run before its backoff, or one delivery can go out twice in parallel; the write-up linked above walks through both interleavings. The in-process queue ([`queue/memory.py`](backend/src/relay/queue/memory.py)) follows the same rules with dicts.
 
 What that means when something crashes:
 

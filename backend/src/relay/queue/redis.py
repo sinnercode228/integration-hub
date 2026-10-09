@@ -9,7 +9,7 @@ Keys (``<prefix>`` defaults to ``relay``)::
 Claiming and requeueing each run as one Lua script: the members are read and moved inside
 the same atomic step, so another worker can't change them in between. Reading in one round
 trip and moving in a ``MULTI`` later let a second worker claim a retry before its backoff and
-take back a lease that another worker had just renewed (``tests/test_queue_races.py``).
+take back a lease that another worker had just taken (``tests/test_queue_races.py``).
 
 Still open: ``ack`` is not fenced by the lease. A worker whose lease ran out can ack a job
 that another worker has taken over, and removes that worker's lease.

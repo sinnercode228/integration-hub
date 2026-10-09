@@ -11,6 +11,17 @@ permissions:
 jobs:
   backend:
     runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis:7-alpine
+        ports: ["6379:6379"]
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 15
+    env:
+      RELAY_TEST_REDIS_URL: redis://localhost:6379/0
     strategy:
       matrix:
         python: ["3.12", "3.13", "3.14"]

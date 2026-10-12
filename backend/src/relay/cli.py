@@ -10,8 +10,10 @@ import sys
 import time
 from pathlib import Path
 
+from pydantic import ValidationError
+
 from relay import __version__
-from relay.config import load_config
+from relay.config import RelayConfig, load_config
 from relay.errors import ConfigError
 from relay.log import configure_logging, get_logger
 from relay.security import sign_payload
@@ -56,8 +58,35 @@ def _worker(_: argparse.Namespace) -> int:
     return 0
 
 
+def _lease_warnings(config: RelayConfig, settings: Settings) -> list[str]:
+    """Destinations whose attempt can outlive the worker's lease on the job."""
+    warnings = []
+    for name, destination in config.destinations.items():
+        timeout = destination.timeout_seconds or settings.default_attempt_timeout
+        if timeout >= settings.lease_seconds:
+            warnings.append(
+                f"warning: destination '{name}': the attempt timeout ({timeout:g} s) is not below "
+                f"the lease ({settings.lease_seconds:g} s, RELAY_LEASE_SECONDS). Another worker "
+                "can take the job over mid-attempt and send it a second time."
+            )
+    return warnings
+
+
 def _check_config(args: argparse.Namespace) -> int:
-    path = Path(args.config) if args.config else Settings().config_path
+    settings: Settings | None
+    settings_error: ValidationError | None = None
+    try:
+        settings = Settings()
+    except ValidationError as exc:
+        if not args.config:
+            print(f"settings error: {exc}", file=sys.stderr)
+            return 1
+        settings, settings_error = None, exc
+    if args.config:
+        path = Path(args.config)
+    else:
+        assert settings is not None  # without --config a settings error returned above
+        path = settings.config_path
     import httpx
 
     from relay.container import build_destinations, build_inbound
@@ -73,6 +102,14 @@ def _check_config(args: argparse.Namespace) -> int:
     except ConfigError as exc:
         print(f"config error: {exc}", file=sys.stderr)
         return 1
+    if settings is None:
+        print(
+            f"warning: RELAY_* settings did not load, lease check skipped: {settings_error}",
+            file=sys.stderr,
+        )
+    else:
+        for warning in _lease_warnings(config, settings):
+            print(warning, file=sys.stderr)
     print(
         f"OK: {len(config.sources)} sources, {len(config.destinations)} destinations, "
         f"{len(config.routes)} routes, stock proxy: {'on' if config.stock else 'off'}"

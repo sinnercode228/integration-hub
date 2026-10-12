@@ -6,13 +6,15 @@ Keys (``<prefix>`` defaults to ``relay``)::
     <prefix>:q:inflight    ZSET  member=job, score=lease deadline
     <prefix>:q:dead        HASH  delivery_id -> {"job", "reason", "at"}
 
-Claiming and requeueing each run as one Lua script: the members are read and moved inside
-the same atomic step, so another worker can't change them in between. Reading in one round
-trip and moving in a ``MULTI`` later let a second worker claim a retry before its backoff and
-take back a lease that another worker had just taken (``tests/test_queue_races.py``).
+Every operation that reads a member and then moves it runs as one Lua script, so another
+worker can't change the member in between. Reading in one round trip and moving in a
+``MULTI`` later let a second worker claim a retry before its backoff and take back a lease
+that another worker had just taken (``tests/test_queue_races.py``).
 
-Still open: ``ack`` is not fenced by the lease. A worker whose lease ran out can ack a job
-that another worker has taken over, and removes that worker's lease.
+The ``inflight`` score is the lease deadline, and it doubles as a fencing token: ``reserve``
+and ``extend`` return it in ``Job.lease``, and ``extend``, ``ack``, ``retry`` and ``bury``
+act only if the member's score still equals it. A worker whose lease ran out and was taken
+over gets ``False``/``None`` back instead of dropping or moving the new owner's job.
 """
 
 from __future__ import annotations
@@ -20,6 +22,7 @@ from __future__ import annotations
 import json
 import time
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Any
 
 from redis.asyncio import Redis
@@ -46,6 +49,56 @@ end
 return #expired
 """
 
+# Shared head of the fenced scripts. KEYS[1]: inflight. ARGV[1]: member, ARGV[2]: the lease
+# token ("" = not fenced; extend never gets "", it returns early for a job without a token).
+_FENCE = """
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if ARGV[2] ~= '' and (not score or tonumber(score) ~= tonumber(ARGV[2])) then
+  return 0
+end
+"""
+
+# ARGV[3]: new lease deadline.
+_EXTEND = (
+    _FENCE
+    + """
+redis.call('ZADD', KEYS[1], 'XX', ARGV[3], ARGV[1])
+return 1
+"""
+)
+
+_ACK = (
+    _FENCE
+    + """
+redis.call('ZREM', KEYS[1], ARGV[1])
+return 1
+"""
+)
+
+# KEYS[2]: scheduled. ARGV[3]: due time.
+_RETRY = (
+    _FENCE
+    + """
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('ZADD', KEYS[2], ARGV[3], ARGV[1])
+return 1
+"""
+)
+
+# KEYS[2]: dead. ARGV[3]: delivery id, ARGV[4]: dead-letter record.
+_BURY = (
+    _FENCE
+    + """
+redis.call('ZREM', KEYS[1], ARGV[1])
+redis.call('HSET', KEYS[2], ARGV[3], ARGV[4])
+return 1
+"""
+)
+
+
+def _token(job: Job) -> str:
+    return "" if job.lease is None else repr(job.lease)
+
 
 class RedisQueue:
     def __init__(
@@ -62,20 +115,50 @@ class RedisQueue:
         self._dead = f"{prefix}:q:dead"
         self._reserve = client.register_script(_RESERVE)
         self._requeue_expired = client.register_script(_REQUEUE_EXPIRED)
+        self._extend = client.register_script(_EXTEND)
+        self._ack = client.register_script(_ACK)
+        self._retry = client.register_script(_RETRY)
+        self._bury = client.register_script(_BURY)
 
     async def enqueue(self, job: Job, *, delay: float = 0.0) -> None:
         await self._redis.zadd(self._scheduled, {job.encode(): self._clock() + max(0.0, delay)})
 
     async def reserve(self, *, limit: int, lease_seconds: float) -> list[Job]:
         now = self._clock()
+        deadline = now + lease_seconds
         members: list[Any] = await self._reserve(
             keys=[self._scheduled, self._inflight],
-            args=[repr(now), repr(now + lease_seconds), limit],
+            args=[repr(now), repr(deadline), limit],
         )
-        return [Job.decode(member) for member in members]
+        return [replace(Job.decode(member), lease=deadline) for member in members]
 
-    async def ack(self, job: Job) -> None:
-        await self._redis.zrem(self._inflight, job.encode())
+    async def extend(self, job: Job, *, lease_seconds: float) -> Job | None:
+        if job.lease is None:
+            return job
+        deadline = self._clock() + lease_seconds
+        done = await self._extend(
+            keys=[self._inflight], args=[job.encode(), _token(job), repr(deadline)]
+        )
+        return replace(job, lease=deadline) if done else None
+
+    async def ack(self, job: Job) -> bool:
+        done = await self._ack(keys=[self._inflight], args=[job.encode(), _token(job)])
+        return bool(done)
+
+    async def retry(self, job: Job, *, delay: float) -> bool:
+        due = self._clock() + max(0.0, delay)
+        done = await self._retry(
+            keys=[self._inflight, self._scheduled], args=[job.encode(), _token(job), repr(due)]
+        )
+        return bool(done)
+
+    async def bury(self, job: Job, reason: str) -> bool:
+        record = json.dumps({"job": job.encode(), "reason": reason, "at": self._clock()})
+        done = await self._bury(
+            keys=[self._inflight, self._dead],
+            args=[job.encode(), _token(job), job.delivery_id, record],
+        )
+        return bool(done)
 
     async def requeue_expired(self) -> int:
         moved: int = await self._requeue_expired(

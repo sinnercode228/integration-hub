@@ -57,5 +57,10 @@ class Settings(BaseSettings):
         return value
 
     @property
+    def default_attempt_timeout(self) -> float:
+        """Attempt timeout for destinations without ``timeout_seconds``."""
+        return max(self.http_timeout_seconds * 2, 5.0)
+
+    @property
     def admin_auth_required(self) -> bool:
         return self.admin_token is not None or self.env == "prod"

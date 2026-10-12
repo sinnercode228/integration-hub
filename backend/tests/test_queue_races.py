@@ -5,6 +5,9 @@ that reads members in one round trip and claims them in the next gives the other
 window between the two. An atomic claim has no such window: whatever runs in between sees
 either the state before the claim or the state after it.
 
+The last group covers a worker whose lease ran out while another worker took the job over:
+every operation it tries with its old token has to be refused.
+
 The tests run on fakeredis, which executes the Lua scripts through lupa. Set
 ``RELAY_TEST_REDIS_URL`` (CI does) to run them against a real Redis server as well.
 """
@@ -81,8 +84,7 @@ async def test_a_retry_is_not_claimed_before_its_backoff(workers: Workers) -> No
         taken = await a.reserve(limit=1, lease_seconds=LEASE)
         claims.extend("a" for _ in taken)
         for j in taken:
-            await a.enqueue(j, delay=2)
-            await a.ack(j)
+            await a.retry(j, delay=2)
 
     hook = AfterFirstRoundTrip(clients[1], worker_a_fails_once)
     claims.extend("b" for _ in await b.reserve(limit=1, lease_seconds=LEASE))
@@ -120,26 +122,52 @@ async def test_requeue_does_not_take_back_a_fresh_lease(workers: Workers, clock:
     assert (depth.ready, depth.scheduled, depth.in_flight) == (0, 0, 1)
 
 
-@pytest.mark.parametrize("backend", ["memory", "redis"])
-@pytest.mark.xfail(
-    strict=True,
-    reason="ack is not fenced by the lease: a worker whose lease ran out removes the lease "
-    "of the worker that took the job over",
-)
-async def test_a_late_ack_does_not_drop_the_new_owners_lease(
-    backend: str, clock: FakeClock
-) -> None:
-    queue: Any = (
-        InMemoryQueue(clock=clock)
-        if backend == "memory"
-        else RedisQueue(fakeredis.FakeAsyncRedis(), prefix="t", clock=clock)
-    )
-    job = Job("d1", "e1")
-    await queue.enqueue(job)
-    await queue.reserve(limit=1, lease_seconds=5)  # worker x
-    clock.advance(6)  # x is stuck on a slow destination, its lease runs out
+async def take_over(queue: Any, clock: FakeClock) -> tuple[Job, Job]:
+    """Worker x claims the job, its lease runs out, worker y claims it again."""
+    await queue.enqueue(Job("d1", "e1"))
+    (x_job,) = await queue.reserve(limit=1, lease_seconds=5)
+    clock.advance(6)  # x is stuck on a slow destination
     assert await queue.requeue_expired() == 1
-    assert await queue.reserve(limit=1, lease_seconds=5) == [job]  # worker y takes over
-    await queue.ack(job)  # x finally finishes and acks
+    (y_job,) = await queue.reserve(limit=1, lease_seconds=5)
+    return x_job, y_job
+
+
+@pytest.fixture(params=["memory", "redis"])
+def queue(request: pytest.FixtureRequest, clock: FakeClock, workers: Workers) -> Any:
+    if request.param == "memory":
+        return InMemoryQueue(clock=clock)
+    _, (q,) = workers(1)
+    return q
+
+
+async def test_a_late_ack_does_not_drop_the_new_owners_lease(queue: Any, clock: FakeClock) -> None:
+    x_job, _ = await take_over(queue, clock)
+    assert await queue.ack(x_job) is False  # x finally finishes and acks
     clock.advance(6)  # y dies without acking
     assert await queue.requeue_expired() == 1, "the job should come back after y's lease"
+
+
+async def test_a_late_retry_does_not_reschedule_the_new_owners_job(
+    queue: Any, clock: FakeClock
+) -> None:
+    x_job, y_job = await take_over(queue, clock)
+    assert await queue.retry(x_job, delay=1) is False
+    clock.advance(1)
+    assert await queue.reserve(limit=1, lease_seconds=5) == [], "only y may hold the job"
+    assert await queue.ack(y_job) is True
+
+
+async def test_a_late_bury_does_not_dead_letter_the_new_owners_job(
+    queue: Any, clock: FakeClock
+) -> None:
+    x_job, y_job = await take_over(queue, clock)
+    assert await queue.bury(x_job, "gave up") is False
+    depth = await queue.depth()
+    assert (depth.in_flight, depth.dead) == (1, 0)
+    assert await queue.ack(y_job) is True
+
+
+async def test_a_late_extend_does_not_steal_the_job_back(queue: Any, clock: FakeClock) -> None:
+    x_job, y_job = await take_over(queue, clock)
+    assert await queue.extend(x_job, lease_seconds=5) is None
+    assert await queue.ack(y_job) is True

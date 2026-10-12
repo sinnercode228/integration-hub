@@ -179,7 +179,7 @@ async def build_container(
         policy=policy,
         concurrency=settings.worker_concurrency,
         lease_seconds=settings.lease_seconds,
-        default_timeout=max(settings.http_timeout_seconds * 2, 5.0),
+        default_timeout=settings.default_attempt_timeout,
         clock=clock,
         rng=rng,
     )

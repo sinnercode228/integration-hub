@@ -67,6 +67,50 @@ class TestQueue:
         await queue.enqueue(job)
         assert await queue.reserve(limit=5, lease_seconds=5) == [job]
 
+    async def test_reserve_returns_the_lease_as_a_token(self, queue: Any, clock: FakeClock) -> None:
+        await queue.enqueue(Job("d1", "e1"))
+        (job,) = await queue.reserve(limit=1, lease_seconds=30)
+        assert job.lease == clock() + 30
+        assert job == Job("d1", "e1")  # the token is not part of the job's identity
+
+    async def test_extend_moves_the_deadline(self, queue: Any, clock: FakeClock) -> None:
+        await queue.enqueue(Job("d1", "e1"))
+        (job,) = await queue.reserve(limit=1, lease_seconds=5)
+        clock.advance(4)
+        renewed = await queue.extend(job, lease_seconds=5)
+        assert renewed is not None and renewed.lease == clock() + 5
+        clock.advance(4)  # past the first deadline, inside the renewed one
+        assert await queue.requeue_expired() == 0
+        assert await queue.ack(job) is False  # the old token no longer matches
+        assert await queue.ack(renewed) is True
+        assert (await queue.depth()).in_flight == 0
+
+    async def test_retry_moves_the_job_in_one_step(self, queue: Any, clock: FakeClock) -> None:
+        await queue.enqueue(Job("d1", "e1"))
+        (job,) = await queue.reserve(limit=1, lease_seconds=30)
+        assert await queue.retry(job, delay=10) is True
+        depth = await queue.depth()
+        assert (depth.ready, depth.scheduled, depth.in_flight) == (0, 1, 0)
+        clock.advance(10)
+        assert await queue.reserve(limit=1, lease_seconds=30) == [job]
+
+    async def test_bury_parks_the_job(self, queue: Any) -> None:
+        await queue.enqueue(Job("d1", "e1"))
+        (job,) = await queue.reserve(limit=1, lease_seconds=30)
+        assert await queue.bury(job, "boom") is True
+        depth = await queue.depth()
+        assert (depth.in_flight, depth.dead) == (0, 1)
+        (parked,) = await queue.dead_letters()
+        assert (parked.job, parked.reason) == (job, "boom")
+
+    async def test_a_job_without_a_token_is_not_fenced(self, queue: Any) -> None:
+        job = Job("d1", "e1")
+        await queue.enqueue(job)
+        await queue.reserve(limit=1, lease_seconds=30)
+        assert await queue.extend(job, lease_seconds=30) == job
+        assert await queue.ack(job) is True
+        assert (await queue.depth()).in_flight == 0
+
     async def test_dead_letters(self, queue: Any, clock: FakeClock) -> None:
         await queue.dead_letter(Job("d1", "e1"), "boom")
         clock.advance(1)

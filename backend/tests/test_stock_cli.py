@@ -134,6 +134,23 @@ class TestCli:
         assert main(["check-config", "--config", str(REPO_ROOT / "config" / "relay.yaml")]) == 0
         assert "5 routes" in capsys.readouterr().out
 
+    def test_check_config_warns_when_an_attempt_can_outlive_the_lease(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("RELAY_LEASE_SECONDS", "15")
+        assert main(["check-config", "--config", str(REPO_ROOT / "config" / "relay.yaml")]) == 0
+        err = capsys.readouterr().err
+        assert "the attempt timeout (20 s) is not below the lease (15 s" in err
+
+    def test_check_config_with_broken_settings(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("RELAY_WORKER_CONCURRENCY", "0")
+        assert main(["check-config", "--config", str(REPO_ROOT / "config" / "relay.yaml")]) == 0
+        assert "lease check skipped" in capsys.readouterr().err
+        assert main(["check-config"]) == 1
+        assert "settings error" in capsys.readouterr().err
+
     def test_check_config_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         bad = tmp_path / "bad.yaml"
         bad.write_text("sources: {x: {connector: nope, allow_unsigned: true}}")

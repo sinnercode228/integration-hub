@@ -166,6 +166,136 @@ class TestRetries:
         assert second.headers["x-relay-attempt"] == "2"
         assert second.headers["idempotency-key"] == delivery.id
 
+    async def test_a_worker_that_lost_its_lease_leaves_the_record_alone(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        route = mock_http.post(HOOK_URL).mock(
+            side_effect=[httpx.Response(200), httpx.Response(503)]
+        )
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "3"})
+        worker, queue = container.worker, container.queue
+        hook = worker.destinations["hook"]
+        send = hook.send
+        calls = 0
+
+        async def slow_send(payload: Any, context: Any) -> Any:
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                # Worker x is still waiting on the destination. Its lease runs out, worker y
+                # takes the job over and delivers it; then x's request fails with 503.
+                clock.advance(worker.lease_seconds + 1)
+                assert await queue.requeue_expired() == 1
+                (y_job,) = await queue.reserve(limit=1, lease_seconds=worker.lease_seconds)
+                await worker.process(y_job)
+            return await send(payload, context)
+
+        hook.send = slow_send  # type: ignore[method-assign]
+        assert await worker.process_due() == 1
+
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        assert delivery.status is DeliveryStatus.DELIVERED, "x must not write its retry over y"
+        assert [a.ok for a in delivery.attempts] == [True]
+        depth = await queue.depth()
+        assert (depth.ready, depth.scheduled, depth.in_flight, depth.dead) == (0, 0, 0, 0)
+        clock.advance(60)
+        assert await worker.process_due() == 0
+        assert route.call_count == 2
+        lost = worker.metrics.registry.get_sample_value(
+            "relay_delivery_attempts_total",
+            {"destination": "hook", "connector": "webhook", "outcome": "lease_lost"},
+        )
+        assert lost == 1, "x's request went out, so it is counted"
+
+    async def test_a_queue_error_before_saving_does_not_cause_a_second_send(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "6"})
+        worker, queue = container.worker, container.queue
+        extend, ack = queue.extend, queue.ack
+        extends = 0
+
+        async def flaky_extend(job: Any, *, lease_seconds: float) -> Any:
+            nonlocal extends
+            extends += 1
+            if extends == 2:  # the renewal right before saving
+                raise ConnectionError("redis went away")
+            return await extend(job, lease_seconds=lease_seconds)
+
+        async def failing_ack(job: Any) -> bool:
+            raise ConnectionError("redis went away")
+
+        queue.extend = flaky_extend  # type: ignore[method-assign]
+        queue.ack = failing_ack  # type: ignore[method-assign]
+        assert await worker.process_due() == 1  # the job crashes after the send and the save
+
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        assert delivery.status is DeliveryStatus.DELIVERED
+        queue.ack = ack  # type: ignore[method-assign]
+        clock.advance(worker.lease_seconds + 1)
+        assert await worker.process_due() == 1  # the lease ran out, the job runs again
+        assert route.call_count == 1, "the re-run finds the attempt and does not send"
+        assert (await queue.depth()).in_flight == 0
+
+    async def test_a_job_that_waited_for_a_slot_gets_a_fresh_lease(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        mock_http.post(HOOK_URL).respond(200)
+        await self.signed_partner_event(api, clock, {"type": "x", "id": "4"})
+        worker, queue = container.worker, container.queue
+        (job,) = await queue.reserve(limit=1, lease_seconds=worker.lease_seconds)
+        clock.advance(worker.lease_seconds - 1)  # almost the whole lease spent waiting
+        hook = worker.destinations["hook"]
+        send = hook.send
+
+        async def slow_send(payload: Any, context: Any) -> Any:
+            clock.advance(10)  # past the deadline from reserve
+            assert await queue.requeue_expired() == 0, "process() renews the lease first"
+            return await send(payload, context)
+
+        hook.send = slow_send  # type: ignore[method-assign]
+        delivery = await worker.process(job)
+        assert delivery is not None and delivery.status is DeliveryStatus.DELIVERED
+        assert (await queue.depth()).in_flight == 0
+
+    async def test_a_job_taken_over_while_waiting_is_not_sent(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        await self.signed_partner_event(api, clock, {"type": "x", "id": "5"})
+        worker, queue = container.worker, container.queue
+        (x_job,) = await queue.reserve(limit=1, lease_seconds=worker.lease_seconds)
+        clock.advance(worker.lease_seconds + 1)
+        assert await queue.requeue_expired() == 1
+        (y_job,) = await queue.reserve(limit=1, lease_seconds=worker.lease_seconds)
+
+        assert await worker.process(x_job) is None
+        assert route.call_count == 0
+        delivered = await worker.process(y_job)
+        assert delivered is not None and delivered.status is DeliveryStatus.DELIVERED
+        assert route.call_count == 1
+
     async def test_dead_letter_and_replay(
         self,
         api: httpx.AsyncClient,

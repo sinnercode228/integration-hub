@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import Callable
+from dataclasses import replace
 
 from relay.queue.base import DeadLetter, Job, QueueDepth
 
@@ -28,14 +29,49 @@ class InMemoryQueue:
                 (at, job.delivery_id, job) for job, at in self._scheduled.items() if at <= now
             )
             taken = [job for _, _, job in due[:limit]]
+            deadline = now + lease_seconds
             for job in taken:
                 del self._scheduled[job]
-                self._in_flight[job] = now + lease_seconds
-            return taken
+                self._in_flight[job] = deadline
+            return [replace(job, lease=deadline) for job in taken]
 
-    async def ack(self, job: Job) -> None:
+    def _holds(self, job: Job) -> bool:
+        deadline = self._in_flight.get(job)
+        return deadline is not None and (job.lease is None or deadline == job.lease)
+
+    async def extend(self, job: Job, *, lease_seconds: float) -> Job | None:
         async with self._lock:
+            if job.lease is None:
+                return job
+            if not self._holds(job):
+                return None
+            deadline = self._clock() + lease_seconds
+            self._in_flight[job] = deadline
+            return replace(job, lease=deadline)
+
+    async def ack(self, job: Job) -> bool:
+        async with self._lock:
+            if job.lease is not None and not self._holds(job):
+                return False
             self._in_flight.pop(job, None)
+            return True
+
+    async def retry(self, job: Job, *, delay: float) -> bool:
+        async with self._lock:
+            if job.lease is not None and not self._holds(job):
+                return False
+            self._in_flight.pop(job, None)
+            self._scheduled[replace(job, lease=None)] = self._clock() + max(0.0, delay)
+            return True
+
+    async def bury(self, job: Job, reason: str) -> bool:
+        async with self._lock:
+            if job.lease is not None and not self._holds(job):
+                return False
+            self._in_flight.pop(job, None)
+            parked = replace(job, lease=None)
+            self._dead[job.delivery_id] = DeadLetter(job=parked, reason=reason, at=self._clock())
+            return True
 
     async def requeue_expired(self) -> int:
         async with self._lock:

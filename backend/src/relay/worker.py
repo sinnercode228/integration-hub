@@ -115,6 +115,12 @@ class DeliveryWorker:
     # -- single job -------------------------------------------------------------------------
 
     async def process(self, job: Job) -> DeliveryRecord | None:
+        # The job may have waited for a slot while its lease ran; renew it before sending.
+        held = await self.queue.extend(job, lease_seconds=self.lease_seconds)
+        if held is None:
+            log.warning("worker.lease_lost", delivery_id=job.delivery_id, stage="start")
+            return None
+        job = held
         delivery = await self.store.get_delivery(job.delivery_id)
         if delivery is None or delivery.is_final:
             await self.queue.ack(job)
@@ -184,14 +190,38 @@ class DeliveryWorker:
                 outcome_label = "dead"
         delivery.attempts.append(attempt)
         delivery.updated_at = now
+
+        # Renew right before writing: if another worker has taken the job over while this
+        # attempt ran, its record and its place in the queue are not ours to overwrite.
+        try:
+            held = await self.queue.extend(job, lease_seconds=self.lease_seconds)
+        except Exception:
+            # Ownership is unknown, not lost. Saving is the smaller risk: if the job runs
+            # again, it finds this attempt recorded instead of sending a second time.
+            log.exception("worker.lease_unknown", delivery_id=delivery.id)
+            held = job
+        if held is None:
+            log.warning(
+                "worker.lease_lost",
+                delivery_id=delivery.id,
+                stage="save",
+                outcome=outcome_label,
+                attempt=attempt.number,
+            )
+            self.metrics.deliveries.labels(delivery.destination, connector_kind, "lease_lost").inc()
+            return delivery
+        job = held
         await self.store.save_delivery(delivery)
 
         if delivery.status is DeliveryStatus.RETRYING:
             assert attempt.retry_in_seconds is not None
-            await self.queue.enqueue(job, delay=attempt.retry_in_seconds)
+            kept = await self.queue.retry(job, delay=attempt.retry_in_seconds)
         elif delivery.status is DeliveryStatus.DEAD:
-            await self.queue.dead_letter(job, delivery.last_error or "failed")
-        await self.queue.ack(job)
+            kept = await self.queue.bury(job, delivery.last_error or "failed")
+        else:
+            kept = await self.queue.ack(job)
+        if not kept:
+            log.warning("worker.lease_lost", delivery_id=delivery.id, stage="finish")
 
         self.metrics.deliveries.labels(delivery.destination, connector_kind, outcome_label).inc()
         log.info(

@@ -11,6 +11,10 @@ Semantics (identical for the in-process and the Redis implementation):
   out and was taken over by another worker can therefore no longer move or drop the job.
   A job without a token (``lease=None``) is not fenced.
 * ``dead_letter`` parks a job without touching *in-flight*; the worker uses ``bury``.
+* ``enqueue_missing(jobs)`` adds only the jobs that are neither scheduled nor in flight and
+  returns them. The check and the add are one atomic step, so it never moves a scheduled
+  job's due time and never puts a second copy of a leased job in the queue. The worker's
+  sweep uses it for deliveries that lost their job.
 """
 
 from __future__ import annotations
@@ -66,6 +70,8 @@ class DeliveryQueue(Protocol):
     async def bury(self, job: Job, reason: str) -> bool: ...
 
     async def requeue_expired(self) -> int: ...
+
+    async def enqueue_missing(self, jobs: list[Job]) -> list[Job]: ...
 
     async def dead_letter(self, job: Job, reason: str) -> None: ...
 

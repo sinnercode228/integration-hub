@@ -12,7 +12,14 @@ from dataclasses import dataclass, field
 
 from relay.config import RelayConfig
 from relay.connectors.base import InboundConnector, InboundRequest
-from relay.domain import DeliveryRecord, EventRecord, aggregate_status, new_id
+from relay.domain import (
+    DeliveryRecord,
+    DeliveryStatus,
+    EventRecord,
+    aggregate_status,
+    new_id,
+    utcnow,
+)
 from relay.errors import PayloadError, SignatureError, UnknownSourceError
 from relay.idempotency import IdempotencyStore, derive_key
 from relay.log import get_logger
@@ -126,8 +133,23 @@ class IngestService:
             except Exception:
                 await self.idempotency.release(key)
                 raise
-            for delivery in record.deliveries:
-                await self.queue.enqueue(Job(delivery_id=delivery.id, event_id=event_id))
+            queued = 0
+            try:
+                for delivery in record.deliveries:
+                    await self.queue.enqueue(Job(delivery_id=delivery.id, event_id=event_id))
+                    queued += 1
+            except Exception as exc:
+                # A job that got in may already be with a worker, so a retry let in as a new
+                # event would send it twice. Then the key stays and the sweep sends the rest.
+                released = queued == 0 and await self._abandon(record, key, exc)
+                log.exception(
+                    "webhook.enqueue_failed",
+                    source=source_id,
+                    event_id=event_id,
+                    queued=queued,
+                    released=released,
+                )
+                raise
 
             counter.labels(source_id, "accepted").inc()
             result.accepted.append(event_id)
@@ -139,3 +161,42 @@ class IngestService:
                 deliveries=len(record.deliveries),
             )
         return result
+
+    async def _abandon(self, record: EventRecord, key: str, exc: Exception) -> bool:
+        """Undo an intake none of whose jobs reached the queue; True if the key was released.
+
+        The sender gets ``500`` and retries, so the retry has to come in as a new event and
+        this one must not be delivered as well. Its deliveries are marked dead first and the
+        key is released after that.
+
+        If the key cannot be released, the retry will be answered as a duplicate. Then the
+        deliveries go back to pending, and the worker's sweep queues them once they are a
+        lease overdue. If marking them fails, the key is kept too: the deliveries not marked
+        yet stay pending for the sweep, the ones already marked can be replayed.
+        """
+        error = (
+            f"not queued at intake ({type(exc).__name__}); "
+            "the sender got 500, so a resend comes in as a new event"
+        )
+        try:
+            for delivery in record.deliveries:
+                failed = delivery.model_copy(
+                    update={"status": DeliveryStatus.DEAD, "last_error": error}
+                )
+                failed.updated_at = utcnow()
+                await self.store.save_delivery(failed)
+        except Exception:
+            log.exception("webhook.abandon_failed", event_id=record.id, stage="mark")
+            return False
+        try:
+            await self.idempotency.release(key)
+        except Exception:
+            log.exception("webhook.abandon_failed", event_id=record.id, stage="release")
+            try:
+                for delivery in record.deliveries:
+                    delivery.updated_at = utcnow()
+                    await self.store.save_delivery(delivery)
+            except Exception:
+                log.exception("webhook.abandon_failed", event_id=record.id, stage="restore")
+            return False
+        return True

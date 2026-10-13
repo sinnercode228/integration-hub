@@ -171,3 +171,34 @@ async def test_a_late_extend_does_not_steal_the_job_back(queue: Any, clock: Fake
     x_job, y_job = await take_over(queue, clock)
     assert await queue.extend(x_job, lease_seconds=5) is None
     assert await queue.ack(y_job) is True
+
+
+# The sweep puts back jobs for deliveries that lost theirs. It must never add a job that is
+# scheduled or that a worker holds, or the job would end up in both sets.
+
+
+async def test_a_sweep_does_not_requeue_a_leased_job(queue: Any, clock: FakeClock) -> None:
+    x_job, y_job = await take_over(queue, clock)
+    assert await queue.enqueue_missing([x_job]) == []
+    assert await queue.reserve(limit=1, lease_seconds=5) == [], "only y may hold the job"
+    assert await queue.ack(y_job) is True
+    assert await queue.enqueue_missing([x_job]) == [x_job]
+
+
+async def test_a_sweep_does_not_add_a_job_another_worker_just_claimed(workers: Workers) -> None:
+    clients, (a, b) = workers(2)
+    job = Job("d1", "e1")
+    taken_by_a: list[Job] = []
+
+    async def worker_a_sweeps_and_claims() -> None:
+        await a.enqueue_missing([job])
+        taken_by_a.extend(await a.reserve(limit=1, lease_seconds=LEASE))
+
+    hook = AfterFirstRoundTrip(clients[1], worker_a_sweeps_and_claims)
+    await b.enqueue_missing([job])
+
+    assert hook.fired
+    assert taken_by_a == [job]
+    # a is sending: b's sweep may not have left a second copy in `scheduled`.
+    depth = await a.depth()
+    assert (depth.ready, depth.scheduled, depth.in_flight) == (0, 0, 1)

@@ -2,18 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Any
 from urllib.parse import urlencode
 
+import fakeredis
 import httpx
 import pytest
 import respx
 
 from relay.container import Container
-from relay.domain import DeliveryStatus, EventStatus
+from relay.domain import DeliveryStatus, EventStatus, utcnow
+from relay.queue import InMemoryQueue, RedisQueue
 from relay.security import sign_payload
 from relay.settings import Settings
+from relay.store.base import EventFilter
 
 from .conftest import FakeClock
 
@@ -118,6 +124,211 @@ class TestWebhookEndpoint:
         (event_id,) = response.json()["accepted"]
         event = await container.store.get_event(event_id)
         assert event is not None and event.status is EventStatus.NO_ROUTE
+
+
+class EnqueueFails:
+    """A queue whose ``enqueue`` raises after ``ok`` successful calls, like Redis going away."""
+
+    def __init__(self, queue: Any, ok: int = 0) -> None:
+        self._queue = queue
+        self._ok = ok
+
+    async def enqueue(self, job: Any, *, delay: float = 0.0) -> None:
+        if self._ok == 0:
+            raise ConnectionError("queue unreachable")
+        self._ok -= 1
+        await self._queue.enqueue(job, delay=delay)
+
+
+@pytest.fixture
+async def raw_api(container: Container) -> AsyncIterator[httpx.AsyncClient]:
+    """Like ``api``, but an unexpected error comes back as a ``500`` response."""
+    from relay.api.app import create_app
+
+    app = create_app(container.settings, container=container)
+    transport = httpx.ASGITransport(app=app, raise_app_exceptions=False)
+    async with httpx.AsyncClient(transport=transport, base_url="http://relay.test") as client:
+        yield client
+
+
+class TestIntakeFailure:
+    async def test_a_failed_enqueue_lets_the_retry_in(
+        self,
+        raw_api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        tg, sheet = mock_lead_destinations(mock_http)
+        container.ingest.queue = EnqueueFails(container.queue)
+        failed = await post_form(raw_api)
+        assert failed.status_code == 500
+        (first,), total = await container.store.list_events(EventFilter())
+        assert total == 1 and first.status is EventStatus.FAILED
+        assert {d.status for d in first.deliveries} == {DeliveryStatus.DEAD}
+        assert "not queued at intake (ConnectionError)" in (first.deliveries[0].last_error or "")
+
+        container.ingest.queue = container.queue
+        retry = await post_form(raw_api)
+        assert retry.status_code == 202, retry.text
+        (event_id,) = retry.json()["accepted"]
+        assert event_id != first.id
+        await drain(container, clock)
+        assert (tg.call_count, sheet.call_count) == (1, 1)
+        event = await container.store.get_event(event_id)
+        assert event is not None and event.status is EventStatus.DELIVERED
+        again = await container.store.get_event(first.id)
+        assert again is not None and again.status is EventStatus.FAILED
+        assert all(not d.attempts for d in again.deliveries)
+
+    async def test_a_job_that_got_in_is_not_sent_again_by_the_retry(
+        self,
+        raw_api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        tg, sheet = mock_lead_destinations(mock_http)
+        worker = container.worker
+
+        class SlowToFail(EnqueueFails):
+            async def enqueue(self, job: Any, *, delay: float = 0.0) -> None:
+                if self._ok == 0:  # a worker takes the first job while this call hangs
+                    assert await worker.process_due() == 1
+                await super().enqueue(job, delay=delay)
+
+        container.ingest.queue = SlowToFail(container.queue, ok=1)
+        assert (await post_form(raw_api)).status_code == 500
+        (event,), _ = await container.store.list_events(EventFilter())
+
+        # One destination already has the lead, so the retry may not create a second event.
+        container.ingest.queue = container.queue
+        retry = await post_form(raw_api)
+        later = utcnow() + timedelta(seconds=worker.lease_seconds + 1)
+        await worker.sweep(now=later)
+        await drain(container, clock)
+        assert (tg.call_count, sheet.call_count) == (1, 1)
+        assert retry.status_code == 200 and retry.json()["duplicates"] == [event.id]
+        delivered = await container.store.get_event(event.id)
+        assert delivered is not None and delivered.status is EventStatus.DELIVERED
+
+    async def test_the_sweep_delivers_when_the_key_cannot_be_released(
+        self,
+        raw_api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        tg, sheet = mock_lead_destinations(mock_http)
+        container.ingest.queue = EnqueueFails(container.queue)
+
+        async def release_fails(key: str) -> None:
+            raise ConnectionError("idempotency store unreachable")
+
+        monkeypatch.setattr(container.idempotency, "release", release_fails)
+        assert (await post_form(raw_api)).status_code == 500
+        (event,), _ = await container.store.list_events(EventFilter())
+        assert event.status is EventStatus.PROCESSING
+        assert {d.status for d in event.deliveries} == {DeliveryStatus.PENDING}
+
+        # The key is still taken, so the retry is a duplicate of the stored event ...
+        container.ingest.queue = container.queue
+        retry = await post_form(raw_api)
+        assert retry.status_code == 200 and retry.json()["duplicates"] == [event.id]
+        # ... and the sweep queues its deliveries once they are a lease overdue.
+        worker = container.worker
+        assert await worker.sweep() == 0
+        later = utcnow() + timedelta(seconds=worker.lease_seconds + 1)
+        assert await worker.sweep(now=later) == 2
+        await drain(container, clock)
+        assert (tg.call_count, sheet.call_count) == (1, 1)
+        delivered = await container.store.get_event(event.id)
+        assert delivered is not None and delivered.status is EventStatus.DELIVERED
+
+    async def test_the_key_stays_taken_when_the_event_cannot_be_marked(
+        self,
+        raw_api: httpx.AsyncClient,
+        container: Container,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        container.ingest.queue = EnqueueFails(container.queue)
+
+        async def store_fails(delivery: Any) -> None:
+            raise OSError("disk full")
+
+        monkeypatch.setattr(container.store, "save_delivery", store_fails)
+        assert (await post_form(raw_api)).status_code == 500
+        monkeypatch.undo()
+        (event,), _ = await container.store.list_events(EventFilter())
+        assert {d.status for d in event.deliveries} == {DeliveryStatus.PENDING}
+        # Releasing the key now would get the lead delivered twice: once as this event,
+        # through the sweep, and once as the retry.
+        container.ingest.queue = container.queue
+        retry = await post_form(raw_api)
+        assert retry.status_code == 200 and retry.json()["duplicates"] == [event.id]
+
+
+@pytest.fixture(params=["memory", "redis"])
+async def worker_queue(request: pytest.FixtureRequest, clock: FakeClock) -> AsyncIterator[Any]:
+    if request.param == "memory":
+        yield InMemoryQueue(clock=clock)
+    else:
+        queue = RedisQueue(fakeredis.FakeAsyncRedis(), prefix="t", clock=clock)
+        yield queue
+        await queue.close()
+
+
+class TestSweep:
+    async def test_deliveries_that_lost_their_job_are_queued_again(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        worker_queue: Any,
+    ) -> None:
+        tg, sheet = mock_lead_destinations(mock_http)
+        # Intake queued the jobs in a memory queue that went away with the old process.
+        container.ingest.queue = InMemoryQueue(clock=clock)
+        worker = container.worker
+        worker.queue = worker_queue
+        (event_id,) = (await post_form(api)).json()["accepted"]
+
+        assert await worker.sweep() == 0, "fresh deliveries may still be on their way in"
+        later = utcnow() + timedelta(seconds=worker.lease_seconds + 1)
+        assert await worker.sweep(now=later) == 2
+        assert await worker.sweep(now=later) == 0, "a queued job is not added twice"
+        (job,) = await worker_queue.reserve(limit=1, lease_seconds=worker.lease_seconds)
+        assert await worker.sweep(now=later) == 0, "nor is a job a worker holds"
+        await worker.process(job)
+        await drain(container, clock)
+        assert (tg.call_count, sheet.call_count) == (1, 1)
+        event = await container.store.get_event(event_id)
+        assert event is not None and event.status is EventStatus.DELIVERED
+        assert await worker.sweep(now=later) == 0
+
+    async def test_the_worker_sweeps_when_it_starts(
+        self, api: httpx.AsyncClient, container: Container, mock_http: respx.MockRouter
+    ) -> None:
+        tg, sheet = mock_lead_destinations(mock_http)
+        container.ingest.queue = InMemoryQueue()
+        (event_id,) = (await post_form(api)).json()["accepted"]
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        for delivery in event.deliveries:  # stored before the restart
+            delivery.updated_at -= timedelta(hours=1)
+            await container.store.save_delivery(delivery)
+
+        stop = asyncio.Event()
+        task = asyncio.create_task(container.worker.run(stop, poll_interval=0.01))
+        for _ in range(200):
+            if tg.call_count and sheet.call_count:
+                break
+            await asyncio.sleep(0.01)
+        stop.set()
+        await task
+        assert (tg.call_count, sheet.call_count) == (1, 1)
 
 
 class TestRetries:

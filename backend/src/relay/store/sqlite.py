@@ -11,6 +11,7 @@ import sqlite3
 import threading
 from collections import defaultdict
 from collections.abc import Callable
+from datetime import datetime
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -243,6 +244,28 @@ class SqliteEventStore:
                     "SELECT doc FROM deliveries WHERE status = ? ORDER BY updated_at DESC LIMIT ?",
                     (status.value, limit),
                 ).fetchall()
+            return [DeliveryRecord.model_validate_json(row["doc"]) for row in rows]
+
+        return await self._run(read)
+
+    async def overdue_deliveries(
+        self, due_before: datetime, limit: int = 1000
+    ) -> list[DeliveryRecord]:
+        # The status index narrows the scan to unfinished deliveries; julianday() compares
+        # the timestamps as instants, whatever their ISO spelling ("Z" or "+00:00").
+        due = "julianday(COALESCE(json_extract(doc, '$.next_attempt_at'), updated_at))"
+
+        def read(conn: sqlite3.Connection) -> list[DeliveryRecord]:
+            rows = conn.execute(
+                f"SELECT doc FROM deliveries WHERE status IN (?, ?) AND {due} < julianday(?)"  # noqa: S608
+                f" ORDER BY {due}, id LIMIT ?",
+                (
+                    DeliveryStatus.PENDING.value,
+                    DeliveryStatus.RETRYING.value,
+                    due_before.isoformat(),
+                    limit,
+                ),
+            ).fetchall()
             return [DeliveryRecord.model_validate_json(row["doc"]) for row in rows]
 
         return await self._run(read)

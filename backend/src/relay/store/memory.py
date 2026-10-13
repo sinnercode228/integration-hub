@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import Counter, defaultdict
+from datetime import datetime
 
 from relay.domain import DeliveryRecord, DeliveryStatus, EventRecord, EventStatus, aggregate_status
 from relay.store.base import EventFilter, StoreStats, matches_query
@@ -69,6 +70,19 @@ class InMemoryEventStore:
         ]
         found.sort(key=lambda d: d.updated_at, reverse=True)
         return found[:limit]
+
+    async def overdue_deliveries(
+        self, due_before: datetime, limit: int = 1000
+    ) -> list[DeliveryRecord]:
+        waiting = (DeliveryStatus.PENDING, DeliveryStatus.RETRYING)
+        found = [
+            (d.next_attempt_at or d.updated_at, d.id, d)
+            for event in self._events.values()
+            for d in event.deliveries
+            if d.status in waiting and (d.next_attempt_at or d.updated_at) < due_before
+        ]
+        found.sort(key=lambda item: item[:2])
+        return [d.model_copy(deep=True) for _, _, d in found[:limit]]
 
     async def stats(self) -> StoreStats:
         stats = StoreStats(events_total=len(self._events))

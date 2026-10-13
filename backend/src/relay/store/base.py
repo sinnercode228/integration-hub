@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Protocol
 
 from relay.domain import DeliveryRecord, DeliveryStatus, EventRecord, EventStatus
@@ -43,6 +44,16 @@ class EventStore(Protocol):
     async def list_deliveries(
         self, status: DeliveryStatus | None = None, limit: int = 100
     ) -> list[DeliveryRecord]: ...
+
+    async def overdue_deliveries(
+        self, due_before: datetime, limit: int = 1000
+    ) -> list[DeliveryRecord]:
+        """Pending or retrying deliveries whose next attempt was due before ``due_before``.
+
+        The due time is ``next_attempt_at``, or ``updated_at`` when it is not set. Longest
+        overdue first.
+        """
+        ...
 
     async def stats(self) -> StoreStats: ...
 

@@ -6,8 +6,8 @@ Keys (``<prefix>`` defaults to ``relay``)::
     <prefix>:q:inflight    ZSET  member=job, score=lease deadline
     <prefix>:q:dead        HASH  delivery_id -> {"job", "reason", "at"}
 
-Every operation that reads a member and then moves it runs as one Lua script, so another
-worker can't change the member in between. Reading in one round trip and moving in a
+Every operation that reads a member and then moves or adds it runs as one Lua script, so
+another worker can't change the member in between. Reading in one round trip and moving in a
 ``MULTI`` later let a second worker claim a retry before its backoff and take back a lease
 that another worker had just taken (``tests/test_queue_races.py``).
 
@@ -47,6 +47,20 @@ for _, member in ipairs(expired) do
   redis.call('ZADD', KEYS[2], 'NX', ARGV[1], member)
 end
 return #expired
+"""
+
+# KEYS: scheduled, inflight. ARGV[1]: now, ARGV[2..]: members. Adds only the members that
+# are in neither set and returns them.
+_ENQUEUE_MISSING = """
+local added = {}
+for i = 2, #ARGV do
+  local member = ARGV[i]
+  if not redis.call('ZSCORE', KEYS[1], member) and not redis.call('ZSCORE', KEYS[2], member) then
+    redis.call('ZADD', KEYS[1], ARGV[1], member)
+    added[#added + 1] = member
+  end
+end
+return added
 """
 
 # Shared head of the fenced scripts. KEYS[1]: inflight. ARGV[1]: member, ARGV[2]: the lease
@@ -115,6 +129,7 @@ class RedisQueue:
         self._dead = f"{prefix}:q:dead"
         self._reserve = client.register_script(_RESERVE)
         self._requeue_expired = client.register_script(_REQUEUE_EXPIRED)
+        self._enqueue_missing = client.register_script(_ENQUEUE_MISSING)
         self._extend = client.register_script(_EXTEND)
         self._ack = client.register_script(_ACK)
         self._retry = client.register_script(_RETRY)
@@ -165,6 +180,15 @@ class RedisQueue:
             keys=[self._inflight, self._scheduled], args=[repr(self._clock())]
         )
         return int(moved)
+
+    async def enqueue_missing(self, jobs: list[Job]) -> list[Job]:
+        if not jobs:
+            return []
+        added: list[Any] = await self._enqueue_missing(
+            keys=[self._scheduled, self._inflight],
+            args=[repr(self._clock()), *(job.encode() for job in jobs)],
+        )
+        return [Job.decode(member) for member in added]
 
     async def dead_letter(self, job: Job, reason: str) -> None:
         record = json.dumps({"job": job.encode(), "reason": reason, "at": self._clock()})

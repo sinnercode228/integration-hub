@@ -82,6 +82,17 @@ class InMemoryQueue:
                 self._scheduled.setdefault(job, now)
             return len(expired)
 
+    async def enqueue_missing(self, jobs: list[Job]) -> list[Job]:
+        async with self._lock:
+            now = self._clock()
+            added = []
+            for job in jobs:
+                bare = replace(job, lease=None)
+                if bare not in self._scheduled and bare not in self._in_flight:
+                    self._scheduled[bare] = now
+                    added.append(bare)
+            return added
+
     async def dead_letter(self, job: Job, reason: str) -> None:
         async with self._lock:
             self._dead[job.delivery_id] = DeadLetter(job=job, reason=reason, at=self._clock())

@@ -84,7 +84,14 @@ class DeliveryWorker:
 
     async def run(self, stop: asyncio.Event, poll_interval: float = 0.5) -> None:
         log.info("worker.started", concurrency=self.concurrency)
+        next_sweep = self.clock()  # at startup, then once per lease
         while not stop.is_set():
+            if self.clock() >= next_sweep:
+                try:
+                    await self.sweep()
+                except Exception:
+                    log.exception("worker.sweep_failed")
+                next_sweep = self.clock() + self.lease_seconds
             try:
                 processed = await self.process_due()
             except Exception:
@@ -103,6 +110,28 @@ class DeliveryWorker:
         if jobs:
             await asyncio.gather(*(self._guarded(job) for job in jobs))
         return len(jobs)
+
+    async def sweep(self, now: datetime | None = None, limit: int = 1000) -> int:
+        """Queue again the deliveries that lost their job. Returns how many were queued.
+
+        A pending or retrying delivery that was due more than a lease ago is either held by
+        a worker, waiting in a backlog, or has no job at all: the memory queue was restarted,
+        or intake stored it and could not queue it. ``enqueue_missing`` adds a job only in
+        the last case, in one atomic step, so a held or scheduled job is never touched.
+        Deliveries due less than a lease ago are left alone, because intake and replay write
+        the delivery before they enqueue it. If a delivery was finished after it was read
+        here, the extra job finds it final and is acked without sending.
+        """
+        due_before = (now or utcnow()) - timedelta(seconds=self.lease_seconds)
+        overdue = await self.store.overdue_deliveries(due_before, limit=limit)
+        if not overdue:
+            return 0
+        added = await self.queue.enqueue_missing(
+            [Job(delivery_id=d.id, event_id=d.event_id) for d in overdue]
+        )
+        for job in added:
+            log.warning("delivery.requeued", delivery_id=job.delivery_id, event_id=job.event_id)
+        return len(added)
 
     async def _guarded(self, job: Job) -> None:
         async with self._semaphore:

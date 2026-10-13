@@ -111,6 +111,22 @@ class TestQueue:
         assert await queue.ack(job) is True
         assert (await queue.depth()).in_flight == 0
 
+    async def test_enqueue_missing_adds_only_absent_jobs(
+        self, queue: Any, clock: FakeClock
+    ) -> None:
+        later, held, lost = Job("d1", "e1"), Job("d2", "e1"), Job("d3", "e1")
+        await queue.enqueue(held)
+        (leased,) = await queue.reserve(limit=1, lease_seconds=30)
+        await queue.enqueue(later, delay=60)
+        assert await queue.enqueue_missing([]) == []
+        assert await queue.enqueue_missing([later, held, lost, lost]) == [lost]
+        depth = await queue.depth()
+        assert (depth.ready, depth.scheduled, depth.in_flight) == (1, 1, 1)
+        assert await queue.reserve(limit=5, lease_seconds=30) == [lost]
+        clock.advance(59)
+        assert await queue.reserve(limit=5, lease_seconds=30) == []  # due time not moved
+        assert await queue.ack(leased) is True  # the lease is untouched
+
     async def test_dead_letters(self, queue: Any, clock: FakeClock) -> None:
         await queue.dead_letter(Job("d1", "e1"), "boom")
         clock.advance(1)
@@ -212,6 +228,26 @@ class TestStore:
         assert total == 3 and len(items) == 1 and items[0].deliveries
         items, _ = await store.list_events(EventFilter(status=EventStatus.DELIVERED))
         assert items == []
+
+    async def test_overdue_deliveries(self, store: Any) -> None:
+        now = utcnow()
+        old, fresh = now - timedelta(minutes=10), now - timedelta(seconds=10)
+        cutoff = now - timedelta(minutes=2)
+        event = make_event(n_deliveries=6)
+        pending_old, pending_fresh, waiting, due, delivered, dead = event.deliveries
+        for d in event.deliveries:
+            d.created_at = d.updated_at = old
+        pending_fresh.updated_at = fresh
+        waiting.status = due.status = DeliveryStatus.RETRYING
+        waiting.next_attempt_at = now + timedelta(hours=1)  # in its backoff
+        due.next_attempt_at = old - timedelta(minutes=1)
+        delivered.status, dead.status = DeliveryStatus.DELIVERED, DeliveryStatus.DEAD
+        await store.add_event(event)
+
+        found = await store.overdue_deliveries(cutoff)
+        assert [d.id for d in found] == [due.id, pending_old.id]  # longest overdue first
+        assert [d.id for d in await store.overdue_deliveries(cutoff, limit=1)] == [due.id]
+        assert await store.overdue_deliveries(old - timedelta(hours=1)) == []
 
     async def test_stats_and_missing(self, store: Any) -> None:
         await store.add_event(make_event("site"))

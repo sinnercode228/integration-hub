@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -17,11 +18,12 @@ import respx
 from relay.container import Container
 from relay.domain import DeliveryStatus, EventStatus, utcnow
 from relay.queue import InMemoryQueue, RedisQueue
+from relay.queue.base import Job
 from relay.security import sign_payload
 from relay.settings import Settings
 from relay.store.base import EventFilter
 
-from .conftest import FakeClock
+from .conftest import FakeClock, LoseNextReply, Workers
 
 TG_URL = "https://tg.test/bot123456:SECRET-BOT-TOKEN/sendMessage"
 SHEET_URL = "https://sheets.test/v4/spreadsheets/sheet-1/values/Leads%21A%3AC:append"
@@ -279,6 +281,23 @@ async def worker_queue(request: pytest.FixtureRequest, clock: FakeClock) -> Asyn
         await queue.close()
 
 
+@pytest.fixture(params=["memory", "redis"])
+def two_workers(
+    request: pytest.FixtureRequest, container: Container, workers: Workers
+) -> tuple[Any, Any]:
+    """Points intake and the worker at one queue. Returns it and another worker's handle on it.
+
+    The Redis case uses separate connections to fakeredis, or to a real Redis when
+    ``RELAY_TEST_REDIS_URL`` is set.
+    """
+    if request.param == "memory":
+        queue = other = container.queue
+    else:
+        _, (queue, other) = workers(2)
+    container.ingest.queue = container.worker.queue = queue
+    return queue, other
+
+
 class TestSweep:
     async def test_deliveries_that_lost_their_job_are_queued_again(
         self,
@@ -506,6 +525,234 @@ class TestRetries:
         delivered = await worker.process(y_job)
         assert delivered is not None and delivered.status is DeliveryStatus.DELIVERED
         assert route.call_count == 1
+
+    # While the connector runs, a heartbeat renews the lease every ``heartbeat_seconds``. The
+    # tests shorten it and move the injected clock from inside the request.
+
+    async def test_the_heartbeat_keeps_the_lease_through_a_slow_request(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        two_workers: tuple[Any, Any],
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        queue, other = two_workers
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "7"})
+        worker = container.worker
+        worker.heartbeat_seconds = 0.001
+        extend = queue.extend
+        renewed = asyncio.Event()
+
+        async def watched_extend(job: Any, *, lease_seconds: float) -> Any:
+            held = await extend(job, lease_seconds=lease_seconds)
+            renewed.set()
+            return held
+
+        hook = worker.destinations["hook"]
+        send = hook.send
+        taken: list[Job] = []
+
+        async def slow_send(payload: Any, context: Any) -> Any:
+            for _ in range(4):  # the request takes two leases
+                renewed.clear()
+                clock.advance(worker.lease_seconds / 2)
+                with contextlib.suppress(TimeoutError):
+                    await asyncio.wait_for(renewed.wait(), timeout=1)  # the next heartbeat
+                await other.requeue_expired()
+                taken.extend(await other.reserve(limit=1, lease_seconds=worker.lease_seconds))
+            return await send(payload, context)
+
+        queue.extend = watched_extend
+        hook.send = slow_send  # type: ignore[method-assign]
+        assert await worker.process_due() == 1
+
+        assert taken == [], "another worker took the job over mid-request"
+        assert route.call_count == 1
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        # The write is fenced with the newest token the heartbeat got.
+        assert delivery.status is DeliveryStatus.DELIVERED
+        assert [a.ok for a in delivery.attempts] == [True]
+        depth = await queue.depth()
+        assert (depth.ready, depth.scheduled, depth.in_flight, depth.dead) == (0, 0, 0, 0)
+
+    async def test_a_heartbeat_that_finds_the_lease_lost_cancels_the_request(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        two_workers: tuple[Any, Any],
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        queue, other = two_workers
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "8"})
+        worker = container.worker
+        worker.heartbeat_seconds = 0.001
+        extend = queue.extend
+        extends = 0
+        taken_over = asyncio.Event()
+
+        async def held_back_extend(job: Any, *, lease_seconds: float) -> Any:
+            nonlocal extends
+            extends += 1
+            if extends > 1:  # renewals after the one at the start wait for y
+                await taken_over.wait()
+            return await extend(job, lease_seconds=lease_seconds)
+
+        hook = worker.destinations["hook"]
+        send = hook.send
+        y_jobs: list[Job] = []
+        cancelled: list[int] = []
+
+        async def hanging_send(payload: Any, context: Any) -> Any:
+            # x's lease runs out while the destination hangs, and worker y takes the job over.
+            clock.advance(worker.lease_seconds + 1)
+            await other.requeue_expired()
+            y_jobs.extend(await other.reserve(limit=1, lease_seconds=worker.lease_seconds))
+            taken_over.set()
+            try:
+                await asyncio.sleep(1)
+            except asyncio.CancelledError:
+                cancelled.append(context.attempt)
+                raise
+            return await send(payload, context)
+
+        queue.extend = held_back_extend
+        hook.send = hanging_send  # type: ignore[method-assign]
+        assert await worker.process_due() == 1
+
+        assert cancelled == [1], "the heartbeat must cancel x's request"
+        assert route.call_count == 0
+        stored = await container.store.get_event(event_id)
+        assert stored is not None
+        (delivery,) = stored.deliveries
+        assert delivery.status is DeliveryStatus.PENDING and delivery.attempts == []
+        lost = worker.metrics.registry.get_sample_value(
+            "relay_delivery_attempts_total",
+            {"destination": "hook", "connector": "webhook", "outcome": "lease_lost"},
+        )
+        assert lost == 1
+
+        hook.send = send  # type: ignore[method-assign]
+        (y_job,) = y_jobs
+        delivered = await worker.process(y_job)
+        assert delivered is not None and delivered.status is DeliveryStatus.DELIVERED
+        assert [a.ok for a in delivered.attempts] == [True]
+        assert route.call_count == 1
+        assert (await queue.depth()).in_flight == 0
+
+    async def test_a_queue_error_during_the_heartbeat_does_not_stop_the_request(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        two_workers: tuple[Any, Any],
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        queue, other = two_workers
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "9"})
+        worker = container.worker
+        worker.heartbeat_seconds = 0.001
+        extend = queue.extend
+        extends = 0
+        failed, renewed = asyncio.Event(), asyncio.Event()
+
+        async def flaky_extend(job: Any, *, lease_seconds: float) -> Any:
+            nonlocal extends
+            extends += 1
+            if extends == 2:  # the first heartbeat
+                failed.set()
+                raise ConnectionError("redis went away")
+            held = await extend(job, lease_seconds=lease_seconds)
+            if extends > 2:
+                renewed.set()
+            return held
+
+        hook = worker.destinations["hook"]
+        send = hook.send
+        taken: list[Job] = []
+
+        async def slow_send(payload: Any, context: Any) -> Any:
+            clock.advance(worker.lease_seconds / 2)
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(failed.wait(), timeout=1)
+                await asyncio.wait_for(renewed.wait(), timeout=1)  # the next heartbeat
+            clock.advance(worker.lease_seconds / 2 + 1)  # past the lease from the start
+            await other.requeue_expired()
+            taken.extend(await other.reserve(limit=1, lease_seconds=worker.lease_seconds))
+            return await send(payload, context)
+
+        queue.extend = flaky_extend
+        hook.send = slow_send  # type: ignore[method-assign]
+        assert await worker.process_due() == 1
+
+        assert taken == [], "another worker took the job over mid-request"
+        assert failed.is_set()
+        assert route.call_count == 1
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        assert delivery.status is DeliveryStatus.DELIVERED
+        assert [a.ok for a in delivery.attempts] == [True]
+        assert (await queue.depth()).in_flight == 0
+
+    async def test_a_heartbeat_whose_reply_was_lost_does_not_cancel_the_request(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+        workers: Workers,
+    ) -> None:
+        route = mock_http.post(HOOK_URL).respond(200)
+        clients, (queue, other) = workers(2)
+        container.ingest.queue = container.worker.queue = queue
+        event_id = await self.signed_partner_event(api, clock, {"type": "x", "id": "10"})
+        worker = container.worker
+        worker.heartbeat_seconds = 0.001
+        extend = queue.extend
+        renewed = asyncio.Event()
+
+        async def watched_extend(job: Any, *, lease_seconds: float) -> Any:
+            held = await extend(job, lease_seconds=lease_seconds)
+            if held is not None:
+                renewed.set()
+            return held
+
+        hook = worker.destinations["hook"]
+        send = hook.send
+        taken: list[Job] = []
+
+        async def slow_send(payload: Any, context: Any) -> Any:
+            clock.advance(worker.lease_seconds / 2)
+            # Redis applies the next heartbeat, but its reply is lost on the way back.
+            lose = LoseNextReply(clients[0])
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(lose.lost.wait(), timeout=1)
+                renewed.clear()
+                await asyncio.wait_for(renewed.wait(), timeout=1)  # the heartbeat after it
+            clock.advance(worker.lease_seconds / 2 + 1)  # past the lease from the start
+            await other.requeue_expired()
+            taken.extend(await other.reserve(limit=1, lease_seconds=worker.lease_seconds))
+            return await send(payload, context)
+
+        queue.extend = watched_extend  # type: ignore[method-assign]
+        hook.send = slow_send  # type: ignore[method-assign]
+        assert await worker.process_due() == 1
+
+        assert route.call_count == 1, "the worker cancelled its own request"
+        assert taken == [], "another worker took the job over mid-request"
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        assert delivery.status is DeliveryStatus.DELIVERED
+        assert [a.ok for a in delivery.attempts] == [True]
+        assert (await queue.depth()).in_flight == 0
 
     async def test_dead_letter_and_replay(
         self,

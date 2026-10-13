@@ -14,7 +14,9 @@ that another worker had just taken (``tests/test_queue_races.py``).
 The ``inflight`` score is the lease deadline, and it doubles as a fencing token: ``reserve``
 and ``extend`` return it in ``Job.lease``, and ``extend``, ``ack``, ``retry`` and ``bury``
 act only if the member's score still equals it. A worker whose lease ran out and was taken
-over gets ``False``/``None`` back instead of dropping or moving the new owner's job.
+over gets ``False``/``None`` back instead of dropping or moving the new owner's job. A renewal
+that raised may have been applied anyway, so ``extend`` also accepts the deadlines that this
+client's failed renewals of the same token tried to set.
 """
 
 from __future__ import annotations
@@ -63,8 +65,8 @@ end
 return added
 """
 
-# Shared head of the fenced scripts. KEYS[1]: inflight. ARGV[1]: member, ARGV[2]: the lease
-# token ("" = not fenced; extend never gets "", it returns early for a job without a token).
+# Shared head of ack, retry and bury. KEYS[1]: inflight. ARGV[1]: member, ARGV[2]: the lease
+# token ("" = not fenced).
 _FENCE = """
 local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
 if ARGV[2] ~= '' and (not score or tonumber(score) ~= tonumber(ARGV[2])) then
@@ -72,14 +74,24 @@ if ARGV[2] ~= '' and (not score or tonumber(score) ~= tonumber(ARGV[2])) then
 end
 """
 
-# ARGV[3]: new lease deadline.
-_EXTEND = (
-    _FENCE
-    + """
+# KEYS[1]: inflight. ARGV[1]: member, ARGV[2]: the lease token, ARGV[3]: new lease deadline,
+# ARGV[4..]: deadlines that this client's earlier renewals of that token tried to set and
+# that raised. Redis may have applied them, so they count as the token too.
+_EXTEND = """
+local score = redis.call('ZSCORE', KEYS[1], ARGV[1])
+if not score then
+  return 0
+end
+local held = tonumber(score) == tonumber(ARGV[2])
+for i = 4, #ARGV do
+  held = held or tonumber(score) == tonumber(ARGV[i])
+end
+if not held then
+  return 0
+end
 redis.call('ZADD', KEYS[1], 'XX', ARGV[3], ARGV[1])
 return 1
 """
-)
 
 _ACK = (
     _FENCE
@@ -127,6 +139,9 @@ class RedisQueue:
         self._scheduled = f"{prefix}:q:scheduled"
         self._inflight = f"{prefix}:q:inflight"
         self._dead = f"{prefix}:q:dead"
+        # (member, token) -> deadlines of renewals that raised; see ``extend``. Finishing the
+        # job drops its entry.
+        self._unconfirmed: dict[tuple[str, float | None], list[float]] = {}
         self._reserve = client.register_script(_RESERVE)
         self._requeue_expired = client.register_script(_REQUEUE_EXPIRED)
         self._enqueue_missing = client.register_script(_ENQUEUE_MISSING)
@@ -150,17 +165,29 @@ class RedisQueue:
     async def extend(self, job: Job, *, lease_seconds: float) -> Job | None:
         if job.lease is None:
             return job
+        member = job.encode()
         deadline = self._clock() + lease_seconds
-        done = await self._extend(
-            keys=[self._inflight], args=[job.encode(), _token(job), repr(deadline)]
-        )
+        # A renewal that raised may still have been applied, for example if the reply was
+        # lost. The caller keeps the old token, so the next renewal of it accepts those
+        # deadlines too instead of taking this worker's own renewal for a takeover.
+        unconfirmed = self._unconfirmed.pop((member, job.lease), [])
+        try:
+            done = await self._extend(
+                keys=[self._inflight],
+                args=[member, _token(job), repr(deadline), *map(repr, unconfirmed)],
+            )
+        except Exception:
+            self._unconfirmed[(member, job.lease)] = [*unconfirmed, deadline]
+            raise
         return replace(job, lease=deadline) if done else None
 
     async def ack(self, job: Job) -> bool:
+        self._unconfirmed.pop((job.encode(), job.lease), None)
         done = await self._ack(keys=[self._inflight], args=[job.encode(), _token(job)])
         return bool(done)
 
     async def retry(self, job: Job, *, delay: float) -> bool:
+        self._unconfirmed.pop((job.encode(), job.lease), None)
         due = self._clock() + max(0.0, delay)
         done = await self._retry(
             keys=[self._inflight, self._scheduled], args=[job.encode(), _token(job), repr(due)]
@@ -168,6 +195,7 @@ class RedisQueue:
         return bool(done)
 
     async def bury(self, job: Job, reason: str) -> bool:
+        self._unconfirmed.pop((job.encode(), job.lease), None)
         record = json.dumps({"job": job.encode(), "reason": reason, "at": self._clock()})
         done = await self._bury(
             keys=[self._inflight, self._dead],

@@ -6,7 +6,8 @@ window between the two. An atomic claim has no such window: whatever runs in bet
 either the state before the claim or the state after it.
 
 The last group covers a worker whose lease ran out while another worker took the job over:
-every operation it tries with its old token has to be refused.
+every operation it tries with its old token has to be refused. The ones after it cover a
+renewal whose reply was lost on the way back.
 
 The tests run on fakeredis, which executes the Lua scripts through lupa. Set
 ``RELAY_TEST_REDIS_URL`` (CI does) to run them against a real Redis server as well.
@@ -14,19 +15,16 @@ The tests run on fakeredis, which executes the Lua scripts through lupa. Set
 
 from __future__ import annotations
 
-import os
-import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import Awaitable, Callable
 from typing import Any
 
-import fakeredis
 import pytest
-from redis.asyncio import Redis
+import redis.exceptions
 
-from relay.queue import InMemoryQueue, RedisQueue
+from relay.queue import InMemoryQueue
 from relay.queue.base import Job
 
-from .conftest import FakeClock
+from .conftest import FakeClock, LoseNextReply, Workers
 
 LEASE = 120.0
 
@@ -46,32 +44,6 @@ class AfterFirstRoundTrip:
             self.fired = True
             await self._action()
         return result
-
-
-Workers = Callable[[int], tuple[list[Any], list[RedisQueue]]]
-
-
-@pytest.fixture
-async def workers(clock: FakeClock) -> AsyncIterator[Workers]:
-    """Makes ``n`` queues on separate connections to one Redis server."""
-    url = os.environ.get("RELAY_TEST_REDIS_URL")
-    server = fakeredis.FakeServer()
-    prefix = f"race-{uuid.uuid4().hex}"
-    clients: list[Any] = []
-
-    def make(n: int) -> tuple[list[Any], list[RedisQueue]]:
-        new = [
-            Redis.from_url(url) if url else fakeredis.FakeAsyncRedis(server=server)
-            for _ in range(n)
-        ]
-        clients.extend(new)
-        return new, [RedisQueue(c, prefix=prefix, clock=clock) for c in new]
-
-    yield make
-    if clients:
-        await clients[0].delete(*(f"{prefix}:q:{k}" for k in ("scheduled", "inflight", "dead")))
-    for client in clients:
-        await client.aclose()
 
 
 async def test_a_retry_is_not_claimed_before_its_backoff(workers: Workers) -> None:
@@ -202,3 +174,42 @@ async def test_a_sweep_does_not_add_a_job_another_worker_just_claimed(workers: W
     # a is sending: b's sweep may not have left a second copy in `scheduled`.
     depth = await a.depth()
     assert (depth.ready, depth.scheduled, depth.in_flight) == (0, 0, 1)
+
+
+# A renewal whose reply is lost: Redis applied it, but the worker got an error and still holds
+# the old token. Its next renewal must not take its own new deadline for another worker's.
+
+
+async def test_an_extend_whose_reply_was_lost_keeps_the_lease(
+    workers: Workers, clock: FakeClock
+) -> None:
+    clients, (a, b) = workers(2)
+    await a.enqueue(Job("d1", "e1"))
+    (job,) = await a.reserve(limit=1, lease_seconds=LEASE)
+    clock.advance(LEASE / 2)
+    LoseNextReply(clients[0])
+    with pytest.raises(redis.exceptions.ConnectionError):
+        await a.extend(job, lease_seconds=LEASE)
+    clock.advance(LEASE / 2 + 1)  # past the lease from reserve, not past the renewed one
+    assert await b.requeue_expired() == 0
+    assert await b.reserve(limit=1, lease_seconds=LEASE) == []
+
+    held = await a.extend(job, lease_seconds=LEASE)  # still with the token from reserve
+    assert held is not None, "the worker took its own renewal for a takeover"
+    assert await a.ack(held) is True
+
+
+async def test_a_lost_reply_does_not_hide_a_takeover(workers: Workers, clock: FakeClock) -> None:
+    clients, (a, b) = workers(2)
+    await a.enqueue(Job("d1", "e1"))
+    (job,) = await a.reserve(limit=1, lease_seconds=LEASE)
+    clock.advance(LEASE / 2)
+    LoseNextReply(clients[0])
+    with pytest.raises(redis.exceptions.ConnectionError):
+        await a.extend(job, lease_seconds=LEASE)
+    clock.advance(LEASE + 1)  # past the renewed lease too
+    assert await b.requeue_expired() == 1
+    (taken,) = await b.reserve(limit=1, lease_seconds=LEASE)
+
+    assert await a.extend(job, lease_seconds=LEASE) is None
+    assert await b.ack(taken) is True

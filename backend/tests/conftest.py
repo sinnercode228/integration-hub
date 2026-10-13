@@ -2,16 +2,24 @@
 
 from __future__ import annotations
 
+import asyncio
+import os
 import random
-from collections.abc import AsyncIterator
+import uuid
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
+from typing import Any
 
+import fakeredis
 import httpx
 import pytest
+import redis.exceptions
 import respx
+from redis.asyncio import Redis
 
 from relay.config import RelayConfig, parse_config
 from relay.container import Container, build_container
+from relay.queue import RedisQueue
 from relay.settings import Settings
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -103,6 +111,51 @@ class FakeClock:
 @pytest.fixture
 def clock() -> FakeClock:
     return FakeClock()
+
+
+Workers = Callable[[int], tuple[list[Any], list[RedisQueue]]]
+
+
+@pytest.fixture
+async def workers(clock: FakeClock) -> AsyncIterator[Workers]:
+    """Makes ``n`` queues on separate connections to one Redis server.
+
+    The server is fakeredis, or a real Redis when ``RELAY_TEST_REDIS_URL`` is set (CI does).
+    """
+    url = os.environ.get("RELAY_TEST_REDIS_URL")
+    server = fakeredis.FakeServer()
+    prefix = f"race-{uuid.uuid4().hex}"
+    clients: list[Any] = []
+
+    def make(n: int) -> tuple[list[Any], list[RedisQueue]]:
+        new = [
+            Redis.from_url(url) if url else fakeredis.FakeAsyncRedis(server=server)
+            for _ in range(n)
+        ]
+        clients.extend(new)
+        return new, [RedisQueue(c, prefix=prefix, clock=clock) for c in new]
+
+    yield make
+    if clients:
+        await clients[0].delete(*(f"{prefix}:q:{k}" for k in ("scheduled", "inflight", "dead")))
+    for client in clients:
+        await client.aclose()
+
+
+class LoseNextReply:
+    """Lets Redis run the client's next script, then raises as if the reply was lost."""
+
+    def __init__(self, client: Any) -> None:
+        self._execute = client.execute_command
+        self.lost = asyncio.Event()
+        client.execute_command = self._wrapped
+
+    async def _wrapped(self, *args: Any, **kwargs: Any) -> Any:
+        result = await self._execute(*args, **kwargs)
+        if args[0] == "EVALSHA" and not self.lost.is_set():
+            self.lost.set()
+            raise redis.exceptions.ConnectionError("Connection closed by server.")
+        return result
 
 
 @pytest.fixture

@@ -141,6 +141,7 @@ class TestCli:
         assert main(["check-config", "--config", str(REPO_ROOT / "config" / "relay.yaml")]) == 0
         err = capsys.readouterr().err
         assert "the attempt timeout (20 s) is not below the lease (15 s" in err
+        assert "renews the lease every 5 s during the attempt" in err
 
     def test_check_config_with_broken_settings(
         self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]

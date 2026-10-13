@@ -9,6 +9,7 @@ import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from relay.config import RelayConfig
 from relay.connectors.base import DeliveryContext, OutboundConnector
@@ -63,6 +64,7 @@ class DeliveryWorker:
         policy: RetryPolicy,
         concurrency: int = 4,
         lease_seconds: float = 120.0,
+        heartbeat_seconds: float | None = None,
         default_timeout: float = 30.0,
         clock: Callable[[], float] = time.time,
         rng: random.Random | None = None,
@@ -75,6 +77,8 @@ class DeliveryWorker:
         self.policy = policy
         self.concurrency = concurrency
         self.lease_seconds = lease_seconds
+        # How often the lease is renewed while the connector runs.
+        self.heartbeat_seconds = heartbeat_seconds or lease_seconds / 3
         self.default_timeout = default_timeout
         self.clock = clock
         self.rng = rng or random.Random()  # noqa: S311
@@ -166,6 +170,7 @@ class DeliveryWorker:
         t0 = time.perf_counter()
         error: DeliveryError | None = None
         outcome = None
+        lost = False
         try:
             if connector is None:
                 raise DeliveryError("destination is not configured anymore", retryable=False)
@@ -175,7 +180,15 @@ class DeliveryWorker:
             context = DeliveryContext(
                 delivery_id=delivery.id, event_id=event.id, attempt=len(delivery.attempts) + 1
             )
-            outcome = await asyncio.wait_for(connector.send(payload, context), timeout=timeout)
+            sending = asyncio.ensure_future(
+                asyncio.wait_for(connector.send(payload, context), timeout=timeout)
+            )
+            held = await self._renew_while(sending, job)
+            if held is None:
+                lost = True
+            else:
+                job = held
+                outcome = sending.result()
         except DeliveryError as exc:
             error = exc
         except TimeoutError:
@@ -186,6 +199,13 @@ class DeliveryWorker:
         duration = time.perf_counter() - t0
 
         connector_kind = delivery.connector
+        if lost:
+            # Another worker has taken the job over mid-request, and the request was cancelled.
+            # It may have reached the destination already, so it is counted, but the record and
+            # the job belong to the new owner.
+            log.warning("worker.lease_lost", delivery_id=delivery.id, stage="send")
+            self.metrics.deliveries.labels(delivery.destination, connector_kind, "lease_lost").inc()
+            return None
         self.metrics.delivery_duration.labels(connector_kind).observe(duration)
         attempt = Attempt(
             number=len(delivery.attempts) + 1,
@@ -264,6 +284,36 @@ class DeliveryWorker:
             error=attempt.error,
         )
         return delivery
+
+    async def _renew_while(self, sending: asyncio.Future[Any], job: Job) -> Job | None:
+        """Renew the lease every ``heartbeat_seconds`` until ``sending`` is done.
+
+        Returns the job with the newest token, or ``None`` if the lease was lost, after
+        cancelling the request. A renewal is never cancelled midway: the queue could apply it
+        and give the job a token this worker never sees. So the loop checks the request only
+        between renewals, and a request that ends during one waits for it to return.
+        """
+        try:
+            while True:
+                await asyncio.wait({sending}, timeout=self.heartbeat_seconds)
+                if sending.done():
+                    return job
+                try:
+                    held = await self.queue.extend(job, lease_seconds=self.lease_seconds)
+                except Exception:
+                    # Ownership is unknown, not lost: keep sending and try again next tick.
+                    log.exception("worker.lease_unknown", delivery_id=job.delivery_id, stage="send")
+                    continue
+                if held is None:
+                    sending.cancel()
+                    await asyncio.wait({sending})
+                    if not sending.cancelled():
+                        sending.exception()  # finished during the renewal; its result is moot
+                    return None
+                job = held
+        finally:
+            if not sending.done():  # this task itself was cancelled
+                sending.cancel()
 
     def _render(
         self, delivery: DeliveryRecord, event: EventRecord, connector: OutboundConnector

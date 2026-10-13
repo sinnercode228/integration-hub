@@ -59,15 +59,21 @@ def _worker(_: argparse.Namespace) -> int:
 
 
 def _lease_warnings(config: RelayConfig, settings: Settings) -> list[str]:
-    """Destinations whose attempt can outlive the worker's lease on the job."""
+    """Destinations whose attempt can outlive the worker's lease on the job.
+
+    The worker renews the lease every third of it while the attempt runs, so such an attempt
+    loses the job only if those renewals fail for a whole lease.
+    """
     warnings = []
+    lease = settings.lease_seconds
     for name, destination in config.destinations.items():
         timeout = destination.timeout_seconds or settings.default_attempt_timeout
-        if timeout >= settings.lease_seconds:
+        if timeout >= lease:
             warnings.append(
                 f"warning: destination '{name}': the attempt timeout ({timeout:g} s) is not below "
-                f"the lease ({settings.lease_seconds:g} s, RELAY_LEASE_SECONDS). Another worker "
-                "can take the job over mid-attempt and send it a second time."
+                f"the lease ({lease:g} s, RELAY_LEASE_SECONDS). The worker renews the lease every "
+                f"{lease / 3:g} s during the attempt; if the queue cannot be reached for a whole "
+                "lease, another worker can take the job over mid-attempt and send it a second time."
             )
     return warnings
 

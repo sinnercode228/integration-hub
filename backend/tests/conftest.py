@@ -142,6 +142,12 @@ async def workers(clock: FakeClock) -> AsyncIterator[Workers]:
         await client.aclose()
 
 
+async def no_answer(request: httpx.Request) -> httpx.Response:
+    """A respx side effect: the server takes the request and never answers."""
+    await asyncio.Event().wait()
+    raise AssertionError("unreachable")
+
+
 class LoseNextReply:
     """Lets Redis run the client's next script, then raises as if the reply was lost."""
 

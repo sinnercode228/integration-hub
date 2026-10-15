@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 from collections.abc import Mapping
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
 from urllib.parse import parse_qs, urlencode
@@ -33,6 +35,8 @@ from relay.connectors.outbound import (
 from relay.connectors.outbound.google_sheets import ServiceAccountTokenProvider
 from relay.errors import ConfigError, DeliveryError, PayloadError, SignatureError
 from relay.security import sign_payload, verify_signature
+
+from .conftest import no_answer
 
 NOW = 1_760_000_000
 CTX = DeliveryContext(delivery_id="dlv_1", event_id="evt_1", attempt=1)
@@ -340,6 +344,8 @@ class TestAmoCrmLead:
         "pipeline_id": 5,
         "tags": ["relay"],
     }
+    lead_url = "https://demo.amocrm.ru/api/v4/leads/complex"
+    note_url = "https://demo.amocrm.ru/api/v4/leads/notes"
 
     async def test_complex_lead_and_note(self, http: httpx.AsyncClient) -> None:
         conn = AmoCrmLeadConnector("amo", options=self.options, http=http)
@@ -367,6 +373,66 @@ class TestAmoCrmLead:
         assert note.called
         # Lead exists -> success even though the note failed (no duplicate leads on retry).
         assert outcome.result == {"lead_id": 100, "contact_id": 200, "note_error": "HTTP 500"}
+
+    @pytest.mark.parametrize(
+        ("note_answer", "note_error"),
+        [
+            (
+                httpx.ConnectError("refused, token amo-secret"),
+                "network error (ConnectError: refused, token ***)",
+            ),
+            (httpx.ReadTimeout("read timed out"), "timeout (ReadTimeout)"),
+            (httpx.Response(502), "HTTP 502"),
+            (httpx.DecodingError("bad gzip"), "unexpected error: DecodingError"),
+        ],
+        ids=["connect-error", "read-timeout", "http-502", "decoding-error"],
+    )
+    async def test_a_failed_note_keeps_the_lead(
+        self, http: httpx.AsyncClient, note_answer: Any, note_error: str
+    ) -> None:
+        conn = AmoCrmLeadConnector("amo", options=self.options, http=http)
+        with respx.mock:
+            lead = respx.post(self.lead_url).respond(json=[{"id": 100, "contact_id": 200}])
+            note = respx.post(self.note_url).mock(side_effect=[note_answer])
+            outcome = await conn.send({"name": "Lead", "note": "call me"}, CTX)
+        assert (lead.call_count, note.call_count) == (1, 1)
+        assert outcome.result == {"lead_id": 100, "contact_id": 200, "note_error": note_error}
+
+    async def test_the_note_gives_up_before_the_attempt_is_cut_off(
+        self, http: httpx.AsyncClient
+    ) -> None:
+        conn = AmoCrmLeadConnector("amo", options=self.options, http=http)
+        context = replace(CTX, deadline=asyncio.get_running_loop().time() + 1)
+        with respx.mock:
+            lead = respx.post(self.lead_url).respond(json=[{"id": 100}])
+            respx.post(self.note_url).mock(side_effect=no_answer)
+            # The worker cuts the attempt off at the deadline, like this wait_for.
+            outcome = await asyncio.wait_for(conn.send({"name": "Lead", "note": "x"}, context), 1)
+        assert lead.call_count == 1
+        assert outcome.result is not None and outcome.result["lead_id"] == 100
+        assert outcome.result["note_error"].startswith("timeout")
+
+    async def test_the_note_is_skipped_when_the_attempt_has_no_time_left(
+        self, http: httpx.AsyncClient
+    ) -> None:
+        conn = AmoCrmLeadConnector("amo", options=self.options, http=http)
+        context = replace(CTX, deadline=asyncio.get_running_loop().time() + 0.4)
+        with respx.mock:
+            respx.post(self.lead_url).respond(json=[{"id": 100}])
+            note = respx.post(self.note_url).respond(201)
+            outcome = await conn.send({"name": "Lead", "note": "x"}, context)
+        assert not note.called
+        assert outcome.result is not None and outcome.result["lead_id"] == 100
+        assert outcome.result["note_error"] == "not sent: the attempt had no time left"
+
+    async def test_the_note_has_its_own_timeout(self, http: httpx.AsyncClient) -> None:
+        options = {**self.options, "note_timeout_seconds": 0.2}
+        conn = AmoCrmLeadConnector("amo", options=options, http=http)
+        with respx.mock:
+            respx.post(self.lead_url).respond(json=[{"id": 100}])
+            respx.post(self.note_url).mock(side_effect=no_answer)
+            outcome = await asyncio.wait_for(conn.send({"name": "Lead", "note": "x"}, CTX), 5)
+        assert outcome.result is not None and outcome.result["note_error"] == "timeout (0.2 s)"
 
     async def test_unauthorized_is_permanent(self, http: httpx.AsyncClient) -> None:
         conn = AmoCrmLeadConnector("amo", options=self.options, http=http)

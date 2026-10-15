@@ -15,15 +15,16 @@ import httpx
 import pytest
 import respx
 
+from relay.config import RelayConfig, parse_config
 from relay.container import Container
-from relay.domain import DeliveryStatus, EventStatus, utcnow
+from relay.domain import DeliveryRecord, DeliveryStatus, EventStatus, utcnow
 from relay.queue import InMemoryQueue, RedisQueue
 from relay.queue.base import Job
 from relay.security import sign_payload
 from relay.settings import Settings
 from relay.store.base import EventFilter
 
-from .conftest import FakeClock, LoseNextReply, Workers
+from .conftest import FakeClock, LoseNextReply, Workers, no_answer
 
 TG_URL = "https://tg.test/bot123456:SECRET-BOT-TOKEN/sendMessage"
 SHEET_URL = "https://sheets.test/v4/spreadsheets/sheet-1/values/Leads%21A%3AC:append"
@@ -820,6 +821,89 @@ class TestRetries:
         event = await container.store.get_event(response.json()["accepted"][0])
         assert event is not None and event.status is EventStatus.PARTIAL
         assert "unknown filter" in (event.deliveries[0].last_error or "")
+
+
+AMO_LEAD_URL = "https://demo.amocrm.ru/api/v4/leads/complex"
+AMO_NOTE_URL = "https://demo.amocrm.ru/api/v4/leads/notes"
+AMO_CONFIG = """
+version: 1
+sources:
+  site:
+    connector: tilda
+    secret: tilda-key
+destinations:
+  amo:
+    connector: amocrm_lead
+    timeout_seconds: 1
+    options:
+      subdomain: demo
+      access_token: amo-secret
+routes:
+  - name: leads
+    match: {source: site}
+    deliver:
+      - to: amo
+"""
+
+
+class TestAmoCrmNote:
+    """Once the lead exists, nothing that happens to the note may create it a second time."""
+
+    @pytest.fixture
+    def config(self) -> RelayConfig:
+        return parse_config(AMO_CONFIG, env={})
+
+    async def deliver_lead(
+        self, api: httpx.AsyncClient, container: Container, clock: FakeClock
+    ) -> DeliveryRecord:
+        form = {**FORM, "Comment": "Перезвоните после обеда"}
+        (event_id,) = (await post_form(api, form)).json()["accepted"]
+        assert await container.worker.process_due() == 1
+        clock.advance(3600)  # past any retry the attempt could have scheduled
+        await drain(container, clock)
+        event = await container.store.get_event(event_id)
+        assert event is not None
+        (delivery,) = event.deliveries
+        return delivery
+
+    async def test_a_network_error_on_the_note_is_not_retried(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        lead = mock_http.post(AMO_LEAD_URL).respond(json=[{"id": 100, "contact_id": 200}])
+        note = mock_http.post(AMO_NOTE_URL).mock(side_effect=httpx.ConnectError("reset"))
+        delivery = await self.deliver_lead(api, container, clock)
+
+        assert lead.call_count == 1, "the retry created a second lead"
+        assert note.call_count == 1
+        assert delivery.status is DeliveryStatus.DELIVERED
+        assert [a.ok for a in delivery.attempts] == [True]
+        assert delivery.result == {
+            "lead_id": 100,
+            "contact_id": 200,
+            "note_error": "network error (ConnectError: reset)",
+        }
+        depth = await container.queue.depth()
+        assert (depth.ready, depth.scheduled, depth.in_flight, depth.dead) == (0, 0, 0, 0)
+
+    async def test_a_note_that_never_answers_does_not_run_the_attempt_out(
+        self,
+        api: httpx.AsyncClient,
+        container: Container,
+        clock: FakeClock,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        lead = mock_http.post(AMO_LEAD_URL).respond(json=[{"id": 100, "contact_id": 200}])
+        mock_http.post(AMO_NOTE_URL).mock(side_effect=no_answer)
+        delivery = await self.deliver_lead(api, container, clock)
+
+        assert lead.call_count == 1, "the retry created a second lead"
+        assert delivery.status is DeliveryStatus.DELIVERED, delivery.last_error
+        assert delivery.result is not None and delivery.result["lead_id"] == 100
+        assert delivery.result["note_error"].startswith("timeout")
 
 
 class TestAdminApi:

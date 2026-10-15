@@ -374,6 +374,19 @@ class TestAmoCrmLead:
         # Lead exists -> success even though the note failed (no duplicate leads on retry).
         assert outcome.result == {"lead_id": 100, "contact_id": 200, "note_error": "HTTP 500"}
 
+    async def test_a_note_that_goes_through_leaves_no_error(self, http: httpx.AsyncClient) -> None:
+        conn = AmoCrmLeadConnector("amo", options=self.options, http=http)
+        with respx.mock:
+            respx.post(self.lead_url).respond(json=[{"id": 100, "contact_id": 200}])
+            note = respx.post(self.note_url).respond(json={"_embedded": {"notes": [{"id": 1}]}})
+            outcome = await conn.send({"name": "Lead", "note": " call me "}, CTX)
+        request = note.calls.last.request
+        assert request.headers["authorization"] == "Bearer amo-secret"
+        assert json.loads(request.content) == [
+            {"entity_id": 100, "note_type": "common", "params": {"text": "call me"}}
+        ]
+        assert outcome.result == {"lead_id": 100, "contact_id": 200}
+
     @pytest.mark.parametrize(
         ("note_answer", "note_error"),
         [

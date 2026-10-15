@@ -292,7 +292,7 @@ More screenshots: [dead letters](docs/screenshots/dead-letters.png), [connectors
 ## Development
 
 ```bash
-cd backend && pytest --cov=relay                 # 198 tests, 92% coverage (coverage.py, branch = true)
+cd backend && pytest --cov=relay                 # 199 tests, 92% coverage (coverage.py, branch = true)
 ruff check src tests && ruff format --check src tests && mypy   # mypy in --strict mode
 cd ../dashboard && npm run lint && npm test      # ESLint + tsc, 15 Vitest tests
 ```

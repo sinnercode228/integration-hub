@@ -178,7 +178,10 @@ class DeliveryWorker:
             delivery.payload = payload
             timeout = self._timeout(delivery)
             context = DeliveryContext(
-                delivery_id=delivery.id, event_id=event.id, attempt=len(delivery.attempts) + 1
+                delivery_id=delivery.id,
+                event_id=event.id,
+                attempt=len(delivery.attempts) + 1,
+                deadline=asyncio.get_running_loop().time() + timeout,
             )
             sending = asyncio.ensure_future(
                 asyncio.wait_for(connector.send(payload, context), timeout=timeout)

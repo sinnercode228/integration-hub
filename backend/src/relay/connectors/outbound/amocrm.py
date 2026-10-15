@@ -2,11 +2,14 @@
 
 A follow-up note (e.g. the form comment) is added with ``/api/v4/leads/notes``. If the lead
 was created but the note failed, the delivery is still *successful*: retrying would create
-a duplicate lead, so the note error is recorded in the result instead.
+a duplicate lead, so the note error is recorded in the result instead. That holds for every
+kind of failure, and the note gives up before the attempt's deadline, so the worker always
+gets the lead id back.
 """
 
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Mapping
 from typing import Any, ClassVar
 
@@ -23,7 +26,14 @@ from relay.connectors.base import (
 )
 from relay.connectors.http import raise_for_status, send_request
 from relay.errors import DeliveryError
+from relay.log import get_logger
 from relay.templating import normalize_phone
+
+log = get_logger(__name__)
+
+# The note stops this long before the attempt's deadline, so that the result with the lead id
+# reaches the worker before the attempt is cut off.
+NOTE_DEADLINE_MARGIN_SECONDS = 0.5
 
 
 class AmoCrmLeadOptions(BaseModel):
@@ -34,6 +44,7 @@ class AmoCrmLeadOptions(BaseModel):
     status_id: int | None = None
     responsible_user_id: int | None = None
     tags: list[str] = Field(default_factory=list)
+    note_timeout_seconds: float = Field(default=5.0, gt=0)
     base_url: str | None = None  # override for tests / proxies
 
 
@@ -149,17 +160,40 @@ class AmoCrmLeadConnector(OutboundConnector):
 
         note = str(data.get("note") or "").strip()
         if note and result["lead_id"]:
-            note_response = await self.http.post(
-                f"{self.base_url}/api/v4/leads/notes",
-                headers=headers,
-                json=[
-                    {
-                        "entity_id": result["lead_id"],
-                        "note_type": "common",
-                        "params": {"text": note},
-                    }
-                ],
-            )
-            if not note_response.is_success:
-                result["note_error"] = f"HTTP {note_response.status_code}"
+            note_error = await self.add_note(result["lead_id"], note, token, context)
+            if note_error:
+                result["note_error"] = note_error
         return DeliveryOutcome(status_code=response.status_code, result=result)
+
+    async def add_note(
+        self, lead_id: Any, text: str, token: str, context: DeliveryContext
+    ) -> str | None:
+        """Add a note to a lead that already exists. Returns why it failed, or ``None``."""
+        budget = self.options.note_timeout_seconds
+        if context.deadline is not None:
+            left = context.deadline - asyncio.get_running_loop().time()
+            budget = min(budget, left - NOTE_DEADLINE_MARGIN_SECONDS)
+        if budget <= 0:
+            return "not sent: the attempt had no time left"
+        try:
+            async with asyncio.timeout(budget):
+                response = await send_request(
+                    self.http,
+                    "POST",
+                    f"{self.base_url}/api/v4/leads/notes",
+                    self.kind,
+                    token,
+                    headers={"Authorization": f"Bearer {token}"},
+                    json=[{"entity_id": lead_id, "note_type": "common", "params": {"text": text}}],
+                )
+        except TimeoutError:
+            return f"timeout ({budget:.1f} s)"
+        except DeliveryError as exc:
+            return exc.message.removeprefix(f"{self.kind}: ")
+        except Exception as exc:
+            # Whatever it was, the lead exists, and a retry would create it again.
+            log.exception("amocrm.note_failed", destination=self.name, lead_id=lead_id)
+            return f"unexpected error: {type(exc).__name__}"
+        if not response.is_success:
+            return f"HTTP {response.status_code}"
+        return None

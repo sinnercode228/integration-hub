@@ -72,6 +72,9 @@ class DeliveryContext:
     delivery_id: str
     event_id: str
     attempt: int
+    # Event loop time (``loop.time()``) at which the worker cuts the attempt off. A connector
+    # that makes several requests uses it to return what it has done before that happens.
+    deadline: float | None = None
 
 
 def parse_options[OptionsT: BaseModel](

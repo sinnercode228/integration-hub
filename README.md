@@ -261,7 +261,7 @@ Without a `.env` the containers use the defaults from `relay.yaml`. For real cre
 | `RELAY_RUN_WORKER` | `true` | `false` when a separate `relay worker` runs |
 | `RELAY_WORKER_CONCURRENCY` | `4` | parallel deliveries per worker process |
 | `RELAY_WORKER_METRICS_PORT` | unset | `relay worker` only: serve `/metrics` and `/healthz` on this port (1 to 65535); unset, the worker serves no HTTP. Compose sets `8001` |
-| `RELAY_WORKER_METRICS_HOST` | `127.0.0.1` | address that port binds to; Compose sets `0.0.0.0` so that other containers can scrape it |
+| `RELAY_WORKER_METRICS_HOST` | `127.0.0.1` | IPv4 address that port binds to, or a name that resolves to one; an IPv6 address such as `::` stops `relay worker` at startup. Compose sets `0.0.0.0` so that other containers can scrape it |
 | `RELAY_LEASE_SECONDS` | `120` | how long a job stays in `inflight` without a renewal before another loop can take it; the worker renews it every third of that while the connector runs |
 | `RELAY_MAX_ATTEMPTS` | `8` | pauses of 2, 4, 8, 16, 32, 64, 128 s, minus up to 20% jitter; about four minutes in total |
 | `RELAY_BACKOFF_BASE_SECONDS` / `_FACTOR` / `_MAX_SECONDS` / `_JITTER` | `2` / `2` / `3600` / `0.2` | |

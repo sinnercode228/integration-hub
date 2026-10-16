@@ -84,13 +84,15 @@ class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
 
     def handle_error(self, request: Any, client_address: Any) -> None:
         # The default prints a traceback to stderr, between the JSON log lines, also for a
-        # client that hung up before its request was read. wsgiref already ignores one that
-        # hangs up while the response is written.
-        if not isinstance(sys.exception(), ConnectionError):
+        # client that hung up or timed out before its request was read. wsgiref already
+        # ignores one that hangs up while the response is written.
+        if not isinstance(sys.exception(), ConnectionError | TimeoutError):
             super().handle_error(request, client_address)  # pragma: no cover - a bug
 
 
 class _QuietHandler(WSGIRequestHandler):
+    timeout = 10  # seconds per read or write; a scraper sends its request as soon as it connects
+
     def log_message(self, format: str, *args: Any) -> None:
         """No access log: it would put plain lines between the JSON log lines on stderr."""
 

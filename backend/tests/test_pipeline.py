@@ -24,7 +24,7 @@ from relay.cli import _run_worker
 from relay.config import RelayConfig, parse_config
 from relay.container import Container
 from relay.domain import DeliveryRecord, DeliveryStatus, EventStatus, utcnow
-from relay.metrics import MetricsServer, RelayMetrics
+from relay.metrics import MetricsServer, RelayMetrics, _QuietHandler
 from relay.queue import InMemoryQueue, RedisQueue
 from relay.queue.base import Job
 from relay.security import sign_payload
@@ -1095,6 +1095,22 @@ class TestMetricsServer:
                 sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
             # accepted after the reset connection, so that one has its thread by now
             assert (await http_get(port, "/healthz"))[0] == 200
+        finally:
+            server.close()
+        join_request_threads()
+        assert capsys.readouterr().err == ""
+
+    def test_a_connection_that_sends_nothing_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Otherwise every such connection keeps a thread and a socket until the worker stops."""
+        assert _QuietHandler.timeout is not None
+        monkeypatch.setattr(_QuietHandler, "timeout", 0.2)  # rather than wait for the real one
+        port = free_port()
+        server = MetricsServer(RelayMetrics(), "127.0.0.1", port)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                assert sock.recv(1) == b""  # closed by the server, well before our own timeout
         finally:
             server.close()
         join_request_threads()

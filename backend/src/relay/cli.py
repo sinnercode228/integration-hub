@@ -9,6 +9,7 @@ import signal
 import sys
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from pydantic import ValidationError
 
@@ -18,6 +19,9 @@ from relay.errors import ConfigError
 from relay.log import configure_logging, get_logger
 from relay.security import sign_payload
 from relay.settings import Settings
+
+if TYPE_CHECKING:
+    from relay.container import Container
 
 
 def _serve(args: argparse.Namespace) -> int:
@@ -34,19 +38,34 @@ def _serve(args: argparse.Namespace) -> int:
     return 0
 
 
-async def _run_worker(settings: Settings) -> None:
+async def _run_worker(
+    settings: Settings, container: Container | None = None, stop: asyncio.Event | None = None
+) -> None:
     from relay.container import build_container
+    from relay.metrics import MetricsServer
 
     log = get_logger("relay.worker")
-    container = await build_container(settings)
-    stop = asyncio.Event()
+    container = container or await build_container(settings)
+    stop = stop or asyncio.Event()
     loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError):  # Windows
             loop.add_signal_handler(sig, stop.set)
+    server: MetricsServer | None = None
     try:
+        if settings.worker_metrics_port is not None:
+            server = MetricsServer(
+                container.metrics, settings.worker_metrics_host, settings.worker_metrics_port
+            )
+            log.info(
+                "worker.metrics_listening",
+                host=settings.worker_metrics_host,
+                port=settings.worker_metrics_port,
+            )
         await container.worker.run(stop, settings.worker_poll_interval)
     finally:
+        if server is not None:
+            server.close()
         await container.aclose()
         log.info("worker.shutdown_complete")
 

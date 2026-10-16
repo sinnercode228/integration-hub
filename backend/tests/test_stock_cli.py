@@ -152,6 +152,24 @@ class TestCli:
         assert main(["check-config"]) == 1
         assert "settings error" in capsys.readouterr().err
 
+    @pytest.mark.parametrize("port", ["0", "65536", "metrics"])
+    def test_check_config_rejects_a_bad_worker_metrics_port(
+        self, port: str, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        monkeypatch.setenv("RELAY_CONFIG_PATH", str(REPO_ROOT / "config" / "relay.yaml"))
+        monkeypatch.setenv("RELAY_WORKER_METRICS_PORT", port)
+        assert main(["check-config"]) == 1
+        err = capsys.readouterr().err
+        assert "settings error" in err and "worker_metrics_port" in err
+
+    def test_worker_metrics_are_off_by_default(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        monkeypatch.delenv("RELAY_WORKER_METRICS_PORT", raising=False)
+        settings = Settings(_env_file=None)  # type: ignore[call-arg]
+        assert settings.worker_metrics_port is None
+        assert settings.worker_metrics_host == "127.0.0.1"
+        monkeypatch.setenv("RELAY_WORKER_METRICS_PORT", "8001")
+        assert Settings(_env_file=None).worker_metrics_port == 8001  # type: ignore[call-arg]
+
     def test_check_config_error(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
         bad = tmp_path / "bad.yaml"
         bad.write_text("sources: {x: {connector: nope, allow_unsigned: true}}")

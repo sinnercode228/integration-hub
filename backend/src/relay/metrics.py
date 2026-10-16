@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import sys
 import threading
 from socketserver import ThreadingMixIn
 from typing import Any
@@ -80,6 +81,13 @@ class RelayMetrics:
 
 class _ThreadingWSGIServer(ThreadingMixIn, WSGIServer):
     daemon_threads = True
+
+    def handle_error(self, request: Any, client_address: Any) -> None:
+        # The default prints a traceback to stderr, between the JSON log lines, also for a
+        # client that hung up before its request was read. wsgiref already ignores one that
+        # hangs up while the response is written.
+        if not isinstance(sys.exception(), ConnectionError):
+            super().handle_error(request, client_address)  # pragma: no cover - a bug
 
 
 class _QuietHandler(WSGIRequestHandler):

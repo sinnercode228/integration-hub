@@ -7,6 +7,7 @@ import contextlib
 import http.client
 import json
 import socket
+import struct
 import threading
 from collections.abc import AsyncIterator
 from datetime import timedelta
@@ -23,6 +24,7 @@ from relay.cli import _run_worker
 from relay.config import RelayConfig, parse_config
 from relay.container import Container
 from relay.domain import DeliveryRecord, DeliveryStatus, EventStatus, utcnow
+from relay.metrics import MetricsServer, RelayMetrics
 from relay.queue import InMemoryQueue, RedisQueue
 from relay.queue.base import Job
 from relay.security import sign_payload
@@ -1070,6 +1072,33 @@ class TestWorkerMetrics:
         stop.set()
         await task
         assert "relay-metrics" not in threads
+
+
+def join_request_threads() -> None:
+    for thread in threading.enumerate():
+        if thread.name.endswith("(process_request_thread)"):
+            thread.join(timeout=5)
+
+
+class TestMetricsServer:
+    """stderr carries the JSON log, one object per line, so the server must not print there."""
+
+    async def test_a_client_that_hangs_up_leaves_stderr_alone(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        port = free_port()
+        server = MetricsServer(RelayMetrics(), "127.0.0.1", port)
+        try:
+            with socket.create_connection(("127.0.0.1", port)) as sock:
+                sock.sendall(b"GET /metr")
+                # close with a reset, like a scraper that gives up mid-request
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            # accepted after the reset connection, so that one has its thread by now
+            assert (await http_get(port, "/healthz"))[0] == 200
+        finally:
+            server.close()
+        join_request_threads()
+        assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("path", ["/openapi.json", "/docs"])

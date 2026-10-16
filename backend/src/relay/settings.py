@@ -39,6 +39,10 @@ class Settings(BaseSettings):
     backoff_max_seconds: float = Field(default=3600.0, gt=0)
     backoff_jitter: float = Field(default=0.2, ge=0, le=1)
 
+    # /metrics and /healthz of `relay worker`, which runs without the API; off without a port
+    worker_metrics_host: str = "127.0.0.1"
+    worker_metrics_port: int | None = Field(default=None, ge=1, le=65535)
+
     # HTTP edge
     max_body_bytes: int = Field(default=1_000_000, gt=0)
     http_timeout_seconds: float = Field(default=10.0, gt=0)

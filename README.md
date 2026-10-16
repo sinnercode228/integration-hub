@@ -146,12 +146,11 @@ The code does nothing about the following. Line numbers are as of this commit.
 - **Double sends after a crash between send and ack.** The connector call is at [`worker.py:187`](backend/src/relay/worker.py#L187), the attempt is saved at line 266 and the job is finished at lines 268-274. A kill in between means one more send after the lease expires; so does a response lost on the way back. Only the outbound webhook carries a stable idempotency header ([`connectors/outbound/webhook.py:55`](backend/src/relay/connectors/outbound/webhook.py#L55)); Telegram, SMTP, Google Sheets and amoCRM can get a second message, email, row or lead.
 - **amoCRM lead creation has no token refresh.** [`connectors/outbound/amocrm.py:150-155`](backend/src/relay/connectors/outbound/amocrm.py#L150-L155) treats `401` as final; `AMOCRM_ACCESS_TOKEN` is rotated by hand, then a restart and a replay.
 - **Google Sheets with a static `access_token` cannot recover from `401`.** The connector invalidates the token and retries ([`google_sheets.py:204-208`](backend/src/relay/connectors/outbound/google_sheets.py#L204-L208)), but `StaticTokenProvider.invalidate` does nothing (lines 50-51), so an expired token goes through all the attempts and dead-letters. `service_account_json` does not have this problem; the static token is for trying things out.
-- **Delivery metrics are not exported when the worker runs separately.** Each process has its own Prometheus registry ([`metrics.py:19`](backend/src/relay/metrics.py#L19)), and `relay worker` serves no HTTP ([`cli.py:35-49`](backend/src/relay/cli.py#L35-L49)). In the Compose layout the API runs with `RELAY_RUN_WORKER=false`, so `relay_delivery_attempts_total` and `relay_delivery_duration_seconds` on its `/metrics` stay empty. Queue depth is read from Redis on every scrape and is correct.
 - **Disabling a destination drops events, it does not pause them.** [`routing.py:72-75`](backend/src/relay/routing.py#L72-L75) skips disabled destinations when deliveries are planned, so events that arrive while a destination is `enabled: false` never get a delivery for it. To pause and catch up later, stop the worker instead.
 - **SQLite is the only persistent store.** The docstring of [`store/sqlite.py`](backend/src/relay/store/sqlite.py#L1-L4) says single-node and means it. `docker-compose.yml` shares one volume between the API and the worker, which works on one host (WAL and `busy_timeout`, lines 69-71) and not across hosts. The `EventStore` protocol ([`store/base.py:31`](backend/src/relay/store/base.py#L31)) is there; a Postgres implementation is not.
 - **Bitrix24 enrichment runs inside the webhook request.** With `rest_webhook_url` set, [`connectors/inbound/bitrix24.py:78-79`](backend/src/relay/connectors/inbound/bitrix24.py#L78-L79) calls `crm.<entity>.get`, with a 5 s timeout (line 111), before the `202` is sent. A failure is soft (`fields.enrichment = "failed"`), but routes that need the contact's phone then get nothing, and nothing enriches the event later.
 - **An attempt that outlives its lease is sent twice if its renewals fail.** [`config.py:51`](backend/src/relay/config.py#L51) accepts any positive `timeout_seconds`; the lease is 120 s by default ([`settings.py:35`](backend/src/relay/settings.py#L35)). While the request runs, the worker renews the lease every 40 s ([`worker.py:291-319`](backend/src/relay/worker.py#L291-L319)), so a slow destination alone no longer lets another worker take the job over. A renewal that fails with an error does not stop the request, though. If one worker cannot reach Redis for a whole lease while another worker can, or its event loop is blocked that long, the other worker takes the job over and sends it again. The first worker's next renewal then returns `None`, and it cancels its request, but the request may have reached the destination already. The fencing token stops the first worker from overwriting the second one's record or moving its job. Its attempt is logged (`worker.lease_lost`) and counted in `relay_delivery_attempts_total` with `outcome="lease_lost"`, but not stored in the delivery's history. `relay check-config` warns when a destination's attempt timeout is not below the lease, since only then can a renewal outage during the attempt matter.
-- **Open endpoints and a token in a URL.** `/metrics`, `/healthz` and `/readyz` have no auth ([`api/ops.py`](backend/src/relay/api/ops.py)); keep them off the public interface. The amoCRM inbound token is a query parameter ([`connectors/inbound/amocrm.py:71`](backend/src/relay/connectors/inbound/amocrm.py#L71); an `X-Relay-Token` header is accepted too). Relay's own request log records the route template, not the URL ([`api/app.py:85-86`](backend/src/relay/api/app.py#L85-L86)), but a reverse proxy in front of it logs the full URL unless told not to.
+- **Open endpoints and a token in a URL.** `/metrics`, `/healthz` and `/readyz` have no auth ([`api/ops.py`](backend/src/relay/api/ops.py)), and neither has the worker's metrics port ([`metrics.py`](backend/src/relay/metrics.py)); keep them off the public interface. The amoCRM inbound token is a query parameter ([`connectors/inbound/amocrm.py:71`](backend/src/relay/connectors/inbound/amocrm.py#L71); an `X-Relay-Token` header is accepted too). Relay's own request log records the route template, not the URL ([`api/app.py:85-86`](backend/src/relay/api/app.py#L85-L86)), but a reverse proxy in front of it logs the full URL unless told not to.
 
 ## Configuration
 
@@ -247,7 +246,7 @@ To serve the built dashboard from the API itself, run `npm run build:admin`, the
 docker compose up --build      # http://localhost:8000/admin/
 ```
 
-Without a `.env` the containers use the defaults from `relay.yaml`. For real credentials, see the note on `.env` under [Configuration](#configuration). The image builds the dashboard and serves it at `/admin/`. The `api` service runs with `RELAY_RUN_WORKER=false`, and `worker` runs `relay worker`; both use the Redis queue and share the SQLite file through the `relay-data` volume, so they have to run on one host. The image healthcheck calls `/healthz`; it is disabled for the worker, which serves no HTTP.
+Without a `.env` the containers use the defaults from `relay.yaml`. For real credentials, see the note on `.env` under [Configuration](#configuration). The image builds the dashboard and serves it at `/admin/`. The `api` service runs with `RELAY_RUN_WORKER=false`, and `worker` runs `relay worker`; both use the Redis queue and share the SQLite file through the `relay-data` volume, so they have to run on one host. The image healthcheck calls `/healthz` on port 8000. The worker serves its own `/healthz` and `/metrics` on port 8001, which other containers in the Compose network can reach and which is not published to the host; its healthcheck calls that port.
 
 ### Settings an operator touches
 
@@ -261,6 +260,8 @@ Without a `.env` the containers use the defaults from `relay.yaml`. For real cre
 | `RELAY_STORE_BACKEND` / `RELAY_SQLITE_PATH` | `sqlite` / `data/relay.db` | a `memory` store exists for tests |
 | `RELAY_RUN_WORKER` | `true` | `false` when a separate `relay worker` runs |
 | `RELAY_WORKER_CONCURRENCY` | `4` | parallel deliveries per worker process |
+| `RELAY_WORKER_METRICS_PORT` | unset | `relay worker` only: serve `/metrics` and `/healthz` on this port (1 to 65535); unset, the worker serves no HTTP. Compose sets `8001` |
+| `RELAY_WORKER_METRICS_HOST` | `127.0.0.1` | IPv4 address that port binds to, or a name that resolves to one; an IPv6 address such as `::` stops `relay worker` at startup. Compose sets `0.0.0.0` so that other containers can scrape it |
 | `RELAY_LEASE_SECONDS` | `120` | how long a job stays in `inflight` without a renewal before another loop can take it; the worker renews it every third of that while the connector runs |
 | `RELAY_MAX_ATTEMPTS` | `8` | pauses of 2, 4, 8, 16, 32, 64, 128 s, minus up to 20% jitter; about four minutes in total |
 | `RELAY_BACKOFF_BASE_SECONDS` / `_FACTOR` / `_MAX_SECONDS` / `_JITTER` | `2` / `2` / `3600` / `0.2` | |
@@ -273,7 +274,23 @@ Without a `.env` the containers use the defaults from `relay.yaml`. For real cre
 
 ### What to watch
 
-`GET /healthz` is liveness and always answers. `GET /readyz` pings the store and the queue and returns `503` with `"status": "degraded"` if either fails. `GET /metrics` is Prometheus text. The series worth a panel are `relay_queue_jobs{state="ready|scheduled|in_flight|dead"}`, `relay_delivery_attempts_total{destination,connector,outcome="delivered|retry|dead"}`, `relay_delivery_duration_seconds{connector}` and `relay_events_received_total{source,result="accepted|duplicate|rejected_signature|invalid_payload|ping"}`. A first alert would be `relay_queue_jobs{state="dead"} > 0`. With a separate worker process the two delivery series are not exported (see [Not handled yet](#not-handled-yet)); the worker's `delivery.attempt` log lines carry the destination, the outcome and the duration of every attempt.
+`GET /healthz` is liveness and always answers. `GET /readyz` pings the store and the queue and returns `503` with `"status": "degraded"` if either fails. `GET /metrics` is Prometheus text. The series worth a panel are `relay_queue_jobs{state="ready|scheduled|in_flight|dead"}`, `relay_delivery_attempts_total{destination,connector,outcome="delivered|retry|dead"}`, `relay_delivery_duration_seconds{connector}` and `relay_events_received_total{source,result="accepted|duplicate|rejected_signature|invalid_payload|ping"}`. A first alert would be `relay_queue_jobs{state="dead"} > 0`.
+
+Each process has its own registry and counts only what it does itself. With `relay serve` and the in-process worker, everything is on the API's `/metrics`. When `relay worker` runs separately, as in Compose, the two delivery series are counted in the worker, and the API lists them without samples. Set `RELAY_WORKER_METRICS_PORT` and the worker serves them on its own `/metrics` ([`metrics.py`](backend/src/relay/metrics.py)), together with `relay_build_info`; queue depth, received events and HTTP requests stay on the API. In Compose that is `worker:8001`, so a Prometheus container added to the same project scrapes both:
+
+```yaml
+scrape_configs:
+  - job_name: relay-api
+    static_configs:
+      - targets: ["api:8000"]
+  - job_name: relay-worker
+    dns_sd_configs:          # every replica after `docker compose up --scale worker=N`
+      - names: [worker]
+        type: A
+        port: 8001
+```
+
+Each worker replica is a target of its own, so sum over them, for example `sum by (destination, outcome) (rate(relay_delivery_attempts_total[5m]))`.
 
 Logs are structlog JSON on stderr, one object per line ([`log.py`](backend/src/relay/log.py)). Every line written while a request is handled carries `request_id`, taken from `X-Request-ID` when a proxy sets one and generated otherwise. Values under keys named `token`, `secret`, `password`, `authorization`, `api_key` or `access_token` are replaced with `***`, and connector secrets are cut out of error messages. Lines to grep for: `webhook.accepted`, `webhook.duplicate`, `webhook.signature_rejected`, `webhook.enqueue_failed` (with `released`), `delivery.attempt` (with `outcome` and `error`), `delivery.replayed`, `delivery.requeued`, `worker.job_crashed`, `worker.iteration_failed`, `worker.sweep_failed`, `stock.serving_stale`.
 
@@ -292,7 +309,7 @@ More screenshots: [dead letters](docs/screenshots/dead-letters.png), [connectors
 ## Development
 
 ```bash
-cd backend && pytest --cov=relay                 # 199 tests, 92% coverage (coverage.py, branch = true)
+cd backend && pytest --cov=relay                 # 207 tests, 93% coverage (coverage.py, branch = true)
 ruff check src tests && ruff format --check src tests && mypy   # mypy in --strict mode
 cd ../dashboard && npm run lint && npm test      # ESLint + tsc, 15 Vitest tests
 ```

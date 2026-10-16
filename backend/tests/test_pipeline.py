@@ -4,7 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import http.client
 import json
+import socket
+import struct
+import threading
 from collections.abc import AsyncIterator
 from datetime import timedelta
 from typing import Any
@@ -14,10 +18,13 @@ import fakeredis
 import httpx
 import pytest
 import respx
+from prometheus_client.parser import text_string_to_metric_families
 
+from relay.cli import _run_worker
 from relay.config import RelayConfig, parse_config
 from relay.container import Container
 from relay.domain import DeliveryRecord, DeliveryStatus, EventStatus, utcnow
+from relay.metrics import MetricsServer, RelayMetrics, _QuietHandler
 from relay.queue import InMemoryQueue, RedisQueue
 from relay.queue.base import Job
 from relay.security import sign_payload
@@ -976,6 +983,138 @@ class TestOps:
         assert ready.json() == {"status": "ready", "checks": {"store": True, "queue": True}}
         metrics = await api.get("/metrics")
         assert "relay_queue_jobs" in metrics.text and "relay_build_info" in metrics.text
+
+
+def free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        port: int = sock.getsockname()[1]
+        return port
+
+
+async def http_get(port: int, path: str) -> tuple[int, str]:
+    """A real HTTP request, which respx does not intercept."""
+
+    def request() -> tuple[int, str]:
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        try:
+            conn.request("GET", path)
+            response = conn.getresponse()
+            return response.status, response.read().decode()
+        finally:
+            conn.close()
+
+    return await asyncio.to_thread(request)
+
+
+def sample(text: str, name: str, **labels: str) -> float | None:
+    for family in text_string_to_metric_families(text):
+        for s in family.samples:
+            if s.name == name and s.labels == labels:
+                return float(s.value)
+    return None
+
+
+class TestWorkerMetrics:
+    """``relay worker`` has no API, so its delivery series need a port of their own."""
+
+    async def test_the_worker_serves_its_delivery_metrics(
+        self,
+        settings: Settings,
+        container: Container,
+        api: httpx.AsyncClient,
+        mock_http: respx.MockRouter,
+    ) -> None:
+        mock_lead_destinations(mock_http)
+        port = free_port()
+        worker_settings = settings.model_copy(
+            update={"worker_metrics_port": port, "worker_poll_interval": 0.01}
+        )
+        stop = asyncio.Event()
+        task = asyncio.create_task(_run_worker(worker_settings, container, stop))
+        try:
+            assert (await post_form(api)).status_code == 202
+            attempts = "relay_delivery_attempts_total"
+            tg = {"destination": "tg", "connector": "telegram", "outcome": "delivered"}
+            sheet = {"destination": "sheet", "connector": "google_sheets", "outcome": "delivered"}
+            status, text = 0, ""
+            for _ in range(200):
+                with contextlib.suppress(ConnectionRefusedError):  # not listening yet
+                    status, text = await http_get(port, "/metrics")
+                    if sample(text, attempts, **tg) and sample(text, attempts, **sheet):
+                        break
+                await asyncio.sleep(0.01)
+            assert status == 200
+            assert sample(text, attempts, **tg) == 1
+            assert sample(text, attempts, **sheet) == 1
+            count = "relay_delivery_duration_seconds_count"
+            assert sample(text, count, connector="telegram") == 1
+            assert "relay-metrics" in [thread.name for thread in threading.enumerate()]
+
+            status, body = await http_get(port, "/healthz")
+            assert status == 200 and json.loads(body)["status"] == "ok"
+            assert (await http_get(port, "/"))[0] == 404
+        finally:
+            stop.set()
+            await task
+        with pytest.raises(ConnectionRefusedError):
+            await http_get(port, "/metrics")
+
+    async def test_no_server_without_the_setting(
+        self, settings: Settings, container: Container
+    ) -> None:
+        assert settings.worker_metrics_port is None
+        stop = asyncio.Event()
+        worker_settings = settings.model_copy(update={"worker_poll_interval": 0.01})
+        task = asyncio.create_task(_run_worker(worker_settings, container, stop))
+        await asyncio.sleep(0.05)
+        threads = [thread.name for thread in threading.enumerate()]
+        stop.set()
+        await task
+        assert "relay-metrics" not in threads
+
+
+def join_request_threads() -> None:
+    for thread in threading.enumerate():
+        if thread.name.endswith("(process_request_thread)"):
+            thread.join(timeout=5)
+
+
+class TestMetricsServer:
+    """stderr carries the JSON log, one object per line, so the server must not print there."""
+
+    async def test_a_client_that_hangs_up_leaves_stderr_alone(
+        self, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        port = free_port()
+        server = MetricsServer(RelayMetrics(), "127.0.0.1", port)
+        try:
+            with socket.create_connection(("127.0.0.1", port)) as sock:
+                sock.sendall(b"GET /metr")
+                # close with a reset, like a scraper that gives up mid-request
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack("ii", 1, 0))
+            # accepted after the reset connection, so that one has its thread by now
+            assert (await http_get(port, "/healthz"))[0] == 200
+        finally:
+            server.close()
+        join_request_threads()
+        assert capsys.readouterr().err == ""
+
+    def test_a_connection_that_sends_nothing_is_closed(
+        self, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+    ) -> None:
+        """Otherwise every such connection keeps a thread and a socket until the worker stops."""
+        assert _QuietHandler.timeout is not None
+        monkeypatch.setattr(_QuietHandler, "timeout", 0.2)  # rather than wait for the real one
+        port = free_port()
+        server = MetricsServer(RelayMetrics(), "127.0.0.1", port)
+        try:
+            with socket.create_connection(("127.0.0.1", port), timeout=5) as sock:
+                assert sock.recv(1) == b""  # closed by the server, well before our own timeout
+        finally:
+            server.close()
+        join_request_threads()
+        assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("path", ["/openapi.json", "/docs"])

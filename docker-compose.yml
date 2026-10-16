@@ -30,11 +30,14 @@ services:
     environment:
       RELAY_QUEUE_BACKEND: redis
       RELAY_REDIS_URL: redis://redis:6379/0
+      RELAY_WORKER_METRICS_HOST: 0.0.0.0  # /metrics and /healthz for scrapers on this network
+      RELAY_WORKER_METRICS_PORT: "8001"
+    expose: ["8001"]                      # not published to the host
     volumes: [relay-data:/app/data]
     depends_on:
       redis: { condition: service_healthy }
     healthcheck:
-      disable: true
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8001/healthz').status == 200 else 1)"]
 
 volumes:
   redis-data:

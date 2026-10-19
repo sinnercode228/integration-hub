@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import html
+import re
 from collections.abc import Callable, Mapping
 from typing import Any, ClassVar, Literal
 
@@ -27,6 +28,30 @@ from relay.connectors.http import send_request
 from relay.errors import DeliveryError
 
 MAX_MESSAGE_LENGTH = 4096
+_HTML_TOKEN = re.compile(r"(?P<tag></?[^<>\s/]+[^<>]*>)|&#?\w+;|.", re.DOTALL)
+
+
+def _cut_html(text: str, limit: int) -> str:
+    """Cut to ``limit`` visible characters (Telegram counts after parsing) and close open tags."""
+    tokens = [(m.group(), m.group("tag") is not None) for m in _HTML_TOKEN.finditer(text)]
+    if sum(not is_tag for _, is_tag in tokens) <= limit:
+        return text
+    out: list[str] = []
+    open_tags: list[str] = []
+    visible = 0
+    for token, is_tag in tokens:
+        if is_tag and token.startswith("</"):
+            name = token[2:-1].strip().lower()
+            if name in open_tags:
+                del open_tags[len(open_tags) - 1 - open_tags[::-1].index(name)]
+        elif is_tag:
+            open_tags.append(token[1:-1].split(maxsplit=1)[0].lower())
+        elif visible == limit - 1:
+            break
+        else:
+            visible += 1
+        out.append(token)
+    return "".join(out) + "…" + "".join(f"</{name}>" for name in reversed(open_tags))
 
 
 class TelegramOptions(BaseModel):
@@ -64,9 +89,11 @@ class TelegramConnector(OutboundConnector):
         text = str(data.get("text") or "").strip()
         if not text:
             raise DeliveryError("telegram: rendered 'text' is empty", retryable=False)
-        if len(text) > MAX_MESSAGE_LENGTH:
-            text = text[: MAX_MESSAGE_LENGTH - 1] + "…"
         opts = self.options
+        if opts.parse_mode == "HTML":
+            text = _cut_html(text, MAX_MESSAGE_LENGTH)
+        elif len(text) > MAX_MESSAGE_LENGTH:
+            text = text[: MAX_MESSAGE_LENGTH - 1] + "…"
         body: dict[str, Any] = {
             "chat_id": data.get("chat_id") or opts.chat_id,
             "text": text,

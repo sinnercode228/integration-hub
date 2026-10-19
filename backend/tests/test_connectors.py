@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
+import html
 import json
+import re
 from collections.abc import Mapping
 from dataclasses import replace
 from datetime import UTC, datetime
@@ -298,6 +300,30 @@ class TestTelegram:
             with pytest.raises(DeliveryError) as info:
                 await conn.send({"text": "x"}, CTX)
         assert info.value.retryable and "SECRET" not in info.value.message
+
+    async def sent_text(self, http: httpx.AsyncClient, text: str, **options: Any) -> str:
+        conn = TelegramConnector("tg", options={**self.options, **options}, http=http)
+        with respx.mock:
+            route = respx.post(self.url).respond(json={"ok": True, "result": {"message_id": 1}})
+            await conn.send({"text": text}, CTX)
+        return str(json.loads(route.calls.last.request.content)["text"])
+
+    async def test_long_html_is_cut_on_visible_text_and_tags_are_closed(
+        self, http: httpx.AsyncClient
+    ) -> None:
+        text = await self.sent_text(http, "<b>Lead</b>\n<i>" + "a&amp;" * 3000 + "</i>")
+        assert text.endswith("a&amp;…</i>")
+        assert "&am…" not in text
+        visible = html.unescape(re.sub(r"<[^>]*>", "", text))
+        assert len(visible) == 4096
+
+    async def test_markup_does_not_count_towards_the_limit(self, http: httpx.AsyncClient) -> None:
+        body = "".join(f"<b>{c}</b>" for c in "x" * 4000)
+        assert await self.sent_text(http, body) == body
+
+    async def test_plain_text_is_cut_as_is(self, http: httpx.AsyncClient) -> None:
+        text = await self.sent_text(http, "<" * 5000, parse_mode=None)
+        assert text == "<" * 4095 + "…"
 
     def test_invalid_options(self, http: httpx.AsyncClient) -> None:
         with pytest.raises(ConfigError):

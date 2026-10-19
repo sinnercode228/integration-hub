@@ -52,7 +52,7 @@ Things to know:
 - Every 429 uses one of the delivery's attempts (8 by default), so a long run of 429s ends in dead letters.
 - The worker has no per-destination rate limit. With `RELAY_WORKER_CONCURRENCY=4`, up to four messages can go to the same chat at the same time.
 - Telegram does not follow the general HTTP rule below: only `429` and `5xx` are retried. `400` (chat not found) and `403` (bot blocked) dead-letter on the first attempt.
-- Text longer than 4096 characters is cut, and the cut does not respect HTML tags or entities. Limit long fields with `truncate` in the template.
+- Text longer than 4096 characters is cut and ends with `…`. In HTML mode only the visible text counts, as in Telegram: tags are free, an entity such as `&amp;` is one character, the cut never splits a tag or entity, and tags still open at the cut are closed. Limit long fields with `truncate` in the template if the end of the message matters.
 
 ### A destination is slow or down
 
@@ -309,7 +309,7 @@ More screenshots: [dead letters](docs/screenshots/dead-letters.png), [connectors
 ## Development
 
 ```bash
-cd backend && pytest --cov=relay                 # 207 tests, 93% coverage (coverage.py, branch = true)
+cd backend && pytest --cov=relay                 # 210 tests, 93% coverage (coverage.py, branch = true)
 ruff check src tests && ruff format --check src tests && mypy   # mypy in --strict mode
 cd ../dashboard && npm run lint && npm test      # ESLint + tsc, 15 Vitest tests
 ```

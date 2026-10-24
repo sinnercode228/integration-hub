@@ -536,7 +536,7 @@ class TestGoogleSheets:
         assert form["grant_type"] == ["urn:ietf:params:oauth:grant-type:jwt-bearer"]
         assert claims["iss"] == info["client_email"]
 
-    async def test_401_invalidates_token_and_retries(self, http: httpx.AsyncClient) -> None:
+    async def test_401_with_static_token_is_not_retryable(self, http: httpx.AsyncClient) -> None:
         conn = GoogleSheetsConnector(
             "sheet", options={"spreadsheet_id": "S", "access_token": "tok"}, http=http
         )
@@ -544,9 +544,42 @@ class TestGoogleSheets:
             respx.post(url__startswith="https://sheets.googleapis.com").respond(401)
             with pytest.raises(DeliveryError) as info:
                 await conn.send({"rows": [["a"]]}, CTX)
-        assert info.value.retryable
+        assert not info.value.retryable
         with pytest.raises(DeliveryError, match="values"):
             await conn.send({"foo": 1}, CTX)
+
+    async def test_401_with_service_account_token_refreshes_and_retries(
+        self, http: httpx.AsyncClient
+    ) -> None:
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(
+            serialization.Encoding.PEM,
+            serialization.PrivateFormat.PKCS8,
+            serialization.NoEncryption(),
+        ).decode()
+        info = {
+            "client_email": "relay@demo.iam.gserviceaccount.com",
+            "private_key": pem,
+            "token_uri": "https://oauth.test/token",
+        }
+        provider = ServiceAccountTokenProvider(info, http)
+        conn = GoogleSheetsConnector(
+            "sheet",
+            options={"spreadsheet_id": "S", "access_token": "placeholder"},
+            http=http,
+            token_provider=provider,
+        )
+        with respx.mock:
+            token_route = respx.post("https://oauth.test/token").respond(
+                json={"access_token": "ya29.first", "expires_in": 3600}
+            )
+            sheets_route = respx.post(url__startswith="https://sheets.googleapis.com").respond(401)
+            with pytest.raises(DeliveryError) as excinfo:
+                await conn.send({"rows": [["a"]]}, CTX)
+        assert excinfo.value.retryable
+        assert token_route.call_count == 1
+        assert sheets_route.call_count == 1
+        assert provider._token is None
 
     def test_requires_auth(self, http: httpx.AsyncClient) -> None:
         with pytest.raises(ConfigError):

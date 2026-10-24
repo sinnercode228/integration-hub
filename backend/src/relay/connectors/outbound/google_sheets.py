@@ -2,7 +2,8 @@
 
 Authentication uses a service account (OAuth 2.0 JWT bearer flow, RS256) implemented with
 PyJWT - no heavy Google SDK. Access tokens are cached until shortly before expiry and
-dropped on ``401`` so the next attempt re-authenticates.
+dropped on ``401`` so the next attempt re-authenticates. A statically configured
+``access_token`` has nothing to refresh, so a ``401`` against it is not retryable.
 """
 
 from __future__ import annotations
@@ -35,12 +36,18 @@ JWT_GRANT = "urn:ietf:params:oauth:grant-type:jwt-bearer"
 
 
 class TokenProvider(Protocol):
+    # True when invalidate() clears a cached token so the next get() refreshes
+    # it; False for providers whose token is fixed in config (nothing to refresh).
+    can_refresh: bool
+
     async def get(self) -> str: ...
 
     def invalidate(self) -> None: ...
 
 
 class StaticTokenProvider:
+    can_refresh = False
+
     def __init__(self, token: str) -> None:
         self._token = token
 
@@ -52,6 +59,8 @@ class StaticTokenProvider:
 
 
 class ServiceAccountTokenProvider:
+    can_refresh = True
+
     def __init__(
         self,
         info: Mapping[str, Any],
@@ -204,7 +213,9 @@ class GoogleSheetsConnector(OutboundConnector):
         if response.status_code == 401:
             self.tokens.invalidate()
             raise DeliveryError(
-                "google_sheets: HTTP 401 - token rejected", retryable=True, status_code=401
+                "google_sheets: HTTP 401 - token rejected",
+                retryable=self.tokens.can_refresh,
+                status_code=401,
             )
         raise_for_status(response, self.kind, token)
         updates = response.json().get("updates", {})
